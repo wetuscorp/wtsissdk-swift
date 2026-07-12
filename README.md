@@ -4,7 +4,11 @@ Official, source-based SDK for wts.is deep links and mobile attribution. It reso
 
 > `0.1.0-alpha.1` · protocol V1 · iOS 15+ · Swift 5.9+
 
-## Install
+## Installation
+
+Use one dependency manager per application target. Swift Package Manager and CocoaPods ship the same source, module name, privacy manifest, minimum deployment target, and SDK version.
+
+### Swift Package Manager
 
 In Xcode choose **File → Add Package Dependencies** and enter:
 
@@ -12,7 +16,33 @@ In Xcode choose **File → Add Package Dependencies** and enter:
 https://github.com/wetuscorp/wtsissdk-swift.git
 ```
 
-Select `0.1.0-alpha.1` and link `WtsSDK`. CocoaPods is temporarily supported with `pod 'WtsSDK', '0.1.0-alpha.1'`.
+Select the exact `0.1.0-alpha.1` version, link the `WtsSDK` product to the application target, then:
+
+```swift
+import WtsSDK
+```
+
+### CocoaPods
+
+Add the CDN source and pin the same SDK version in your `Podfile`:
+
+```ruby
+source 'https://cdn.cocoapods.org/'
+
+platform :ios, '15.0'
+
+target 'YourApp' do
+  pod 'WtsSDK', '0.1.0-alpha.1'
+end
+```
+
+Then install the dependency:
+
+```bash
+bundle exec pod install
+```
+
+Open the generated `.xcworkspace` and import `WtsSDK`. Do not add the package through Swift Package Manager when the same application target already receives it through CocoaPods.
 
 ## Configure and handle links
 
