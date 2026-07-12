@@ -1,0 +1,25 @@
+name: Release
+on:
+  push:
+    tags: ['*.*.*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: macos-15
+    environment: release
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify tag and contracts
+        run: |
+          test "${GITHUB_REF_NAME}" = "$(ruby -e 'puts File.read("WtsSDK.podspec")[/s.version = '\''([^'\'']+)/, 1]')"
+          chmod +x scripts/verify-contracts.sh
+          scripts/verify-contracts.sh
+      - run: swift test --parallel
+      - run: pod lib lint WtsSDK.podspec --allow-warnings
+      - run: pod trunk push WtsSDK.podspec --allow-warnings
+        env:
+          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+Pods/
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
+.env*
+!.env.example
