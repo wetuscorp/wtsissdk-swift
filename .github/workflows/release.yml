@@ -17,9 +17,33 @@ jobs:
           scripts/verify-contracts.sh
       - run: swift test --parallel
       - run: pod lib lint WtsSDK.podspec --allow-warnings
-      - run: pod trunk push WtsSDK.podspec --allow-warnings
+      - name: Check CocoaPods Trunk registry
+        id: cocoapods_registry
+        env:
+          PACKAGE_VERSION: ${{ github.ref_name }}
+        run: |
+          status="$(curl --silent --show-error --output /tmp/wts-sdk-pod.json --write-out '%{http_code}' https://trunk.cocoapods.org/api/v1/pods/WtsSDK)"
+          case "$status" in
+            200)
+              if jq --exit-status --arg version "$PACKAGE_VERSION" '.versions | any(.name == $version)' /tmp/wts-sdk-pod.json >/dev/null; then
+                echo "published=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "published=false" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected CocoaPods Trunk response: HTTP $status" >&2
+              exit 1
+              ;;
+          esac
+      - if: steps.cocoapods_registry.outputs.published != 'true'
+        run: pod trunk push WtsSDK.podspec --allow-warnings
         env:
           COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
-      - run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+      - name: Create GitHub release
+        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
