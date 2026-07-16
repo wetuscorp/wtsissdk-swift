@@ -68,3 +68,57 @@ struct EventBatchResponse: Codable, Sendable {
     let duplicates: [String]
     let rejected: [Rejected]
 }
+
+struct IdentityContext: Codable, Sendable {
+    let installId: String
+    let sessionId: String?
+}
+
+struct UserUpdateOperations: Codable, Sendable {
+    let set: [String: WtsUserValue]?
+    let setOnce: [String: WtsUserValue]?
+    let unset: [String]?
+    let increment: [String: Double]?
+}
+
+struct IdentityMutationRequest: Codable, Sendable, Equatable {
+    let schemaVersion: Int
+    let clientMutationId: String
+    let occurredAt: Date
+    let identity: IdentityContext
+    let type: String
+    let externalUserId: String?
+    let attributes: [String: WtsUserValue]?
+    let operations: UserUpdateOperations?
+    let attribution: WtsReportedAttribution?
+    let metadata: WtsMetadata
+
+    static func == (lhs: IdentityMutationRequest, rhs: IdentityMutationRequest) -> Bool {
+        lhs.clientMutationId == rhs.clientMutationId
+    }
+}
+
+struct IdentityMutationBatchRequest: Codable, Sendable {
+    let schemaVersion: Int
+    let mutations: [IdentityMutationRequest]
+}
+
+struct IdentityMutationBatchResponse: Codable, Sendable {
+    struct Rejected: Codable, Sendable {
+        let clientMutationId: String
+        let code: String
+        let message: String
+        let retryable: Bool
+    }
+
+    let accepted: [String]
+    let duplicates: [String]
+    let rejected: [Rejected]
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        accepted = try container.decode([String].self, forKey: .accepted)
+        duplicates = try container.decode([String].self, forKey: .duplicates)
+        rejected = try container.decodeIfPresent([Rejected].self, forKey: .rejected) ?? []
+    }
+}

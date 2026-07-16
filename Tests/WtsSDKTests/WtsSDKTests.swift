@@ -89,12 +89,113 @@ final class WtsSDKTests: XCTestCase {
         XCTAssertEqual(response.rejected.first?.retryable, false)
     }
 
+    func testIdentityRequiresConsentBeforePersistentQueueing() async throws {
+        let identityStore = MemoryIdentityMutationStore()
+        let transport = MockTransport { request in
+            XCTAssertEqual(request.url?.path, "/api/v1/sdk/v2/identity/mutations")
+            return (Data("""
+            {
+              "accepted": [],
+              "duplicates": [],
+              "rejected": [{
+                "clientMutationId": "00000000-0000-0000-0000-000000000000",
+                "code": "PROFILE_SUPPRESSED",
+                "message": "Suppressed",
+                "retryable": false
+              }]
+            }
+            """.utf8), 202)
+        }
+        let sdk = WtsSDK(
+            transport: transport,
+            identity: StaticIdentity(),
+            store: MemoryEventStore(),
+            identityStore: identityStore
+        )
+        try await sdk.configure(appKey: "public-app-key")
+
+        do {
+            try await sdk.identify("customer_1842")
+            XCTFail("Expected profileConsentRequired")
+        } catch let error as WtsSDKError {
+            XCTAssertEqual(error, .profileConsentRequired)
+        }
+
+        try await sdk.setProfileConsent(.granted)
+        try await sdk.identify("customer_1842", attributes: ["plan": .string("enterprise")])
+        let queued = try identityStore.load()
+        XCTAssertEqual(queued.count, 1)
+    }
+
+    func testOpaqueExternalUserIdIsPreservedAndConsentDenialQueuesReset() async throws {
+        let identityStore = MemoryIdentityMutationStore()
+        let sdk = WtsSDK(
+            transport: MockTransport { _ in (Self.emptyBatchFixture, 202) },
+            identity: StaticIdentity(),
+            store: MemoryEventStore(),
+            identityStore: identityStore
+        )
+        try await sdk.configure(appKey: "public-app-key")
+        try await sdk.setProfileConsent(.granted)
+        try await sdk.identify(" customer_1842 ")
+
+        XCTAssertEqual(try identityStore.load().first?.externalUserId, " customer_1842 ")
+
+        try await sdk.setProfileConsent(.denied)
+        let queued = try identityStore.load()
+        XCTAssertEqual(queued.count, 1)
+        XCTAssertEqual(queued.first?.type, "reset_identity")
+    }
+
+    func testOversizedIdentityMutationIsRejectedBeforePersistence() async throws {
+        let identityStore = MemoryIdentityMutationStore()
+        let sdk = WtsSDK(
+            transport: MockTransport { _ in (Self.emptyBatchFixture, 202) },
+            identity: StaticIdentity(),
+            store: MemoryEventStore(),
+            identityStore: identityStore
+        )
+        try await sdk.configure(appKey: "public-app-key")
+        try await sdk.setProfileConsent(.granted)
+        let attributes = Dictionary(
+            uniqueKeysWithValues: (0..<50).map {
+                ("attribute_\($0)", WtsUserValue.string(String(repeating: "x", count: 2_048)))
+            }
+        )
+
+        do {
+            try await sdk.identify("customer_1842", attributes: attributes)
+            XCTFail("Expected invalidProfile")
+        } catch let error as WtsSDKError {
+            guard case .invalidProfile = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertTrue(try identityStore.load().isEmpty)
+    }
+
+    func testErrorsExposeStableCodesAndFallbackURLs() {
+        let fallbackURL = URL(string: "https://wts.is/fallback")!
+
+        XCTAssertEqual(WtsSDKError.timeout(fallbackURL: fallbackURL).code, "TIMEOUT")
+        XCTAssertEqual(
+            WtsSDKError.timeout(fallbackURL: fallbackURL).fallbackURL,
+            fallbackURL
+        )
+        XCTAssertEqual(
+            WtsSDKError.profileConsentRequired.code,
+            "PROFILE_CONSENT_REQUIRED"
+        )
+    }
+
     private static func fixture(_ name: String) throws -> Data {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        return try Data(contentsOf: root.appendingPathComponent("contracts/v1/fixtures/\(name)"))
+        return try Data(
+            contentsOf: root.appendingPathComponent("contracts/mobile/v2/fixtures/\(name)")
+        )
     }
 
     private static let emptyBatchFixture = Data("""
@@ -132,4 +233,14 @@ private final class MemoryEventStore: EventStoring, @unchecked Sendable {
 
     func load() throws -> [EventRequest] { lock.withLock { events } }
     func save(_ events: [EventRequest]) throws { lock.withLock { self.events = events } }
+}
+
+private final class MemoryIdentityMutationStore: IdentityMutationStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var mutations: [IdentityMutationRequest] = []
+
+    func load() throws -> [IdentityMutationRequest] { lock.withLock { mutations } }
+    func save(_ mutations: [IdentityMutationRequest]) throws {
+        lock.withLock { self.mutations = mutations }
+    }
 }
