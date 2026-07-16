@@ -83,10 +83,18 @@ public actor WtsSDK {
     }
 
     public func setProfileConsent(_ consent: WtsProfileConsent) throws {
-        profileConsentGranted = consent == .granted
-        if !profileConsentGranted {
-            try identityStore.save([])
+        if consent == .granted {
+            profileConsentGranted = true
+            return
         }
+        profileConsentGranted = false
+        try identityStore.save([])
+        guard appKey != nil else {
+            identitySessionId = UUID().uuidString.lowercased()
+            return
+        }
+        try enqueueIdentity(type: "reset_identity")
+        identitySessionId = UUID().uuidString.lowercased()
     }
 
     public func identify(
@@ -94,14 +102,13 @@ public actor WtsSDK {
         attributes: [String: WtsUserValue] = [:]
     ) throws {
         try requireProfileConsent()
-        let normalized = externalUserId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalized.isEmpty, normalized.count <= 128 else {
+        guard !externalUserId.isEmpty, externalUserId.utf16.count <= 128 else {
             throw WtsSDKError.invalidProfile(reason: "externalUserId must contain 1 to 128 characters.")
         }
         try validate(attributes: attributes)
         try enqueueIdentity(
             type: "identify",
-            externalUserId: normalized,
+            externalUserId: externalUserId,
             attributes: attributes.isEmpty ? nil : attributes
         )
     }
@@ -176,9 +183,14 @@ public actor WtsSDK {
                 fallbackURL: nil
             )
             let terminal = Set(response.accepted + response.duplicates + response.rejected.filter { !$0.retryable }.map(\.clientEventId))
-            try store.save(queue.filter { !terminal.contains($0.clientEventId) })
-            retryAttempt = 0
-            if queue.count > batch.count { scheduleFlush(after: 0) }
+            let remaining = queue.filter { !terminal.contains($0.clientEventId) }
+            try store.save(remaining)
+            if response.rejected.contains(where: \.retryable) {
+                scheduleRetry()
+            } else {
+                retryAttempt = 0
+                if !remaining.isEmpty { scheduleFlush(after: 0) }
+            }
         } catch let error as WtsSDKError {
             if case .server(let status, _) = error, (400..<500).contains(status), status != 429 {
                 log(.error, "Discarding an invalid event batch (HTTP \(status)).")
@@ -211,7 +223,11 @@ public actor WtsSDK {
                     + response.duplicates
                     + response.rejected.filter { !$0.retryable }.map(\.clientMutationId)
             )
-            try identityStore.save(queue.filter { !terminal.contains($0.clientMutationId) })
+            let remaining = queue.filter { !terminal.contains($0.clientMutationId) }
+            try identityStore.save(remaining)
+            if response.rejected.contains(where: \.retryable) {
+                throw RetryableBatchRejection()
+            }
         } catch let error as WtsSDKError {
             if case .server(let status, _) = error,
                (400..<500).contains(status),
@@ -287,24 +303,28 @@ public actor WtsSDK {
         attribution: WtsReportedAttribution? = nil
     ) throws {
         guard appKey != nil else { throw WtsSDKError.notConfigured }
-        var queue = try identityStore.load()
-        queue.append(
-            IdentityMutationRequest(
-                schemaVersion: 1,
-                clientMutationId: UUID().uuidString.lowercased(),
-                occurredAt: Date(),
-                identity: IdentityContext(
-                    installId: try identity.value(),
-                    sessionId: identitySessionId
-                ),
-                type: type,
-                externalUserId: externalUserId,
-                attributes: attributes,
-                operations: operations,
-                attribution: attribution,
-                metadata: .current
-            )
+        let mutation = IdentityMutationRequest(
+            schemaVersion: 1,
+            clientMutationId: UUID().uuidString.lowercased(),
+            occurredAt: Date(),
+            identity: IdentityContext(
+                installId: try identity.value(),
+                sessionId: identitySessionId
+            ),
+            type: type,
+            externalUserId: externalUserId,
+            attributes: attributes,
+            operations: operations,
+            attribution: attribution,
+            metadata: .current
         )
+        guard encodedSize(
+            IdentityMutationBatchRequest(schemaVersion: 1, mutations: [mutation])
+        ) <= 65_536 else {
+            throw WtsSDKError.invalidProfile(reason: "Identity mutation cannot exceed 64 KiB.")
+        }
+        var queue = try identityStore.load()
+        queue.append(mutation)
         while queue.count > 100 || encodedSize(queue) > 1_048_576 {
             queue.removeFirst()
         }
@@ -401,3 +421,5 @@ public actor WtsSDK {
         print("[WtsSDK] \(message)")
     }
 }
+
+private struct RetryableBatchRejection: Error {}

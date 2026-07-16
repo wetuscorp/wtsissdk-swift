@@ -81,7 +81,7 @@ The queue is atomic, FIFO and bounded to 100 events/1 MiB. Batches are capped at
 
 ## User identity and reported attribution
 
-Profile operations require an explicit consent decision from the host application. Use your own stable, opaque customer ID rather than an email address as `externalUserId`.
+Profile operations require an explicit consent decision from the host application. Use your own stable, opaque customer ID rather than an email address as `externalUserId`; the value is case-sensitive and is not trimmed or normalized.
 
 ```swift
 try WtsSDK.shared.setProfileConsent(.granted)
@@ -113,7 +113,7 @@ try WtsSDK.shared.setReportedAttribution(
 )
 ```
 
-Call `resetIdentity()` on logout. It removes the current profile binding, rotates the anonymous/session context and preserves the installation identity used for deterministic mobile delivery. Identity mutations use a persistent FIFO queue and are flushed before events.
+Call `resetIdentity()` on logout. It removes the current profile binding, rotates the anonymous/session context and preserves the installation identity used for deterministic mobile delivery. Setting profile consent to `.denied` also queues a binding reset while anonymous analytics remains available. Identity mutations use a persistent FIFO queue and are flushed before events.
 
 ## Platform behavior
 
@@ -123,4 +123,4 @@ Call `resetIdentity()` on logout. It removes the current profile binding, rotate
 - `getDeferredDeepLink()` intentionally returns `nil` on iOS; deterministic post-install deferred attribution is not promised.
 - No IDFA, pasteboard attribution, GAID, fingerprinting, or automatic navigation.
 
-See the installable sample in `Examples/Quickstart`, [security policy](SECURITY.md), and [support policy](SUPPORT.md). Full integration documentation: https://wts.is/docs/sdk/ios
+See the installable sample in `Examples/Quickstart`, [security policy](SECURITY.md), and [support policy](SUPPORT.md). Full integration documentation: https://wts.is/en/resources/docs/sdk-ios

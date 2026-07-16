@@ -127,6 +127,67 @@ final class WtsSDKTests: XCTestCase {
         XCTAssertEqual(queued.count, 1)
     }
 
+    func testOpaqueExternalUserIdIsPreservedAndConsentDenialQueuesReset() async throws {
+        let identityStore = MemoryIdentityMutationStore()
+        let sdk = WtsSDK(
+            transport: MockTransport { _ in (Self.emptyBatchFixture, 202) },
+            identity: StaticIdentity(),
+            store: MemoryEventStore(),
+            identityStore: identityStore
+        )
+        try await sdk.configure(appKey: "public-app-key")
+        try await sdk.setProfileConsent(.granted)
+        try await sdk.identify(" customer_1842 ")
+
+        XCTAssertEqual(try identityStore.load().first?.externalUserId, " customer_1842 ")
+
+        try await sdk.setProfileConsent(.denied)
+        let queued = try identityStore.load()
+        XCTAssertEqual(queued.count, 1)
+        XCTAssertEqual(queued.first?.type, "reset_identity")
+    }
+
+    func testOversizedIdentityMutationIsRejectedBeforePersistence() async throws {
+        let identityStore = MemoryIdentityMutationStore()
+        let sdk = WtsSDK(
+            transport: MockTransport { _ in (Self.emptyBatchFixture, 202) },
+            identity: StaticIdentity(),
+            store: MemoryEventStore(),
+            identityStore: identityStore
+        )
+        try await sdk.configure(appKey: "public-app-key")
+        try await sdk.setProfileConsent(.granted)
+        let attributes = Dictionary(
+            uniqueKeysWithValues: (0..<50).map {
+                ("attribute_\($0)", WtsUserValue.string(String(repeating: "x", count: 2_048)))
+            }
+        )
+
+        do {
+            try await sdk.identify("customer_1842", attributes: attributes)
+            XCTFail("Expected invalidProfile")
+        } catch let error as WtsSDKError {
+            guard case .invalidProfile = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertTrue(try identityStore.load().isEmpty)
+    }
+
+    func testErrorsExposeStableCodesAndFallbackURLs() {
+        let fallbackURL = URL(string: "https://wts.is/fallback")!
+
+        XCTAssertEqual(WtsSDKError.timeout(fallbackURL: fallbackURL).code, "TIMEOUT")
+        XCTAssertEqual(
+            WtsSDKError.timeout(fallbackURL: fallbackURL).fallbackURL,
+            fallbackURL
+        )
+        XCTAssertEqual(
+            WtsSDKError.profileConsentRequired.code,
+            "PROFILE_CONSENT_REQUIRED"
+        )
+    }
+
     private static func fixture(_ name: String) throws -> Data {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

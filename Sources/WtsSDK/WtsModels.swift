@@ -175,6 +175,23 @@ public enum WtsSDKError: Error, Sendable, Equatable {
     case profileConsentRequired
     case storage
 
+    public var code: String {
+        switch self {
+        case .notConfigured: "NOT_CONFIGURED"
+        case .invalidAppKey: "INVALID_APP_KEY"
+        case .invalidURL: "INVALID_URL"
+        case .noMatch: "NO_MATCH"
+        case .timeout: "TIMEOUT"
+        case .network: "NETWORK_ERROR"
+        case .server: "SERVER_ERROR"
+        case .invalidResponse: "INVALID_RESPONSE"
+        case .invalidEvent: "INVALID_EVENT"
+        case .invalidProfile: "INVALID_PROFILE"
+        case .profileConsentRequired: "PROFILE_CONSENT_REQUIRED"
+        case .storage: "STORAGE_ERROR"
+        }
+    }
+
     public var fallbackURL: URL? {
         switch self {
         case .invalidURL(let url), .timeout(let url), .network(let url),
