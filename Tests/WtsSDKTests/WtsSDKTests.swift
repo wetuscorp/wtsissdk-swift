@@ -89,12 +89,52 @@ final class WtsSDKTests: XCTestCase {
         XCTAssertEqual(response.rejected.first?.retryable, false)
     }
 
+    func testIdentityRequiresConsentBeforePersistentQueueing() async throws {
+        let identityStore = MemoryIdentityMutationStore()
+        let transport = MockTransport { request in
+            XCTAssertEqual(request.url?.path, "/api/v1/sdk/v2/identity/mutations")
+            return (Data("""
+            {
+              "accepted": [],
+              "duplicates": [],
+              "rejected": [{
+                "clientMutationId": "00000000-0000-0000-0000-000000000000",
+                "code": "PROFILE_SUPPRESSED",
+                "message": "Suppressed",
+                "retryable": false
+              }]
+            }
+            """.utf8), 202)
+        }
+        let sdk = WtsSDK(
+            transport: transport,
+            identity: StaticIdentity(),
+            store: MemoryEventStore(),
+            identityStore: identityStore
+        )
+        try await sdk.configure(appKey: "public-app-key")
+
+        do {
+            try await sdk.identify("customer_1842")
+            XCTFail("Expected profileConsentRequired")
+        } catch let error as WtsSDKError {
+            XCTAssertEqual(error, .profileConsentRequired)
+        }
+
+        try await sdk.setProfileConsent(.granted)
+        try await sdk.identify("customer_1842", attributes: ["plan": .string("enterprise")])
+        let queued = try identityStore.load()
+        XCTAssertEqual(queued.count, 1)
+    }
+
     private static func fixture(_ name: String) throws -> Data {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        return try Data(contentsOf: root.appendingPathComponent("contracts/v1/fixtures/\(name)"))
+        return try Data(
+            contentsOf: root.appendingPathComponent("contracts/mobile/v2/fixtures/\(name)")
+        )
     }
 
     private static let emptyBatchFixture = Data("""
@@ -132,4 +172,14 @@ private final class MemoryEventStore: EventStoring, @unchecked Sendable {
 
     func load() throws -> [EventRequest] { lock.withLock { events } }
     func save(_ events: [EventRequest]) throws { lock.withLock { self.events = events } }
+}
+
+private final class MemoryIdentityMutationStore: IdentityMutationStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var mutations: [IdentityMutationRequest] = []
+
+    func load() throws -> [IdentityMutationRequest] { lock.withLock { mutations } }
+    func save(_ mutations: [IdentityMutationRequest]) throws {
+        lock.withLock { self.mutations = mutations }
+    }
 }

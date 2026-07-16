@@ -2,7 +2,7 @@
 
 Official, source-based SDK for wts.is deep links and mobile attribution. It resolves verified Universal Links, returns an application-owned route, and queues registered custom events and revenue safely while offline. The SDK never navigates your UI.
 
-> `0.1.0-alpha.1` · protocol V1 · iOS 15+ · Swift 5.9+
+> `0.2.0-alpha.1` · Mobile Protocol V2 + Identity V1 · iOS 15+ · Swift 5.9+
 
 ## Installation
 
@@ -16,7 +16,7 @@ In Xcode choose **File → Add Package Dependencies** and enter:
 https://github.com/wetuscorp/wtsissdk-swift.git
 ```
 
-Select the exact `0.1.0-alpha.1` version, link the `WtsSDK` product to the application target, then:
+Select the exact `0.2.0-alpha.1` version, link the `WtsSDK` product to the application target, then:
 
 ```swift
 import WtsSDK
@@ -32,7 +32,7 @@ source 'https://cdn.cocoapods.org/'
 platform :ios, '15.0'
 
 target 'YourApp' do
-  pod 'WtsSDK', '0.1.0-alpha.1'
+  pod 'WtsSDK', '0.2.0-alpha.1'
 end
 ```
 
@@ -79,12 +79,48 @@ await WtsSDK.shared.flush() // optional; automatic flushing is enabled
 
 The queue is atomic, FIFO and bounded to 100 events/1 MiB. Batches are capped at 50 events/64 KiB. Retriable failures use exponential backoff with jitter; accepted, duplicate and permanently rejected IDs are removed.
 
+## User identity and reported attribution
+
+Profile operations require an explicit consent decision from the host application. Use your own stable, opaque customer ID rather than an email address as `externalUserId`.
+
+```swift
+try WtsSDK.shared.setProfileConsent(.granted)
+
+try WtsSDK.shared.identify(
+    "customer_1842",
+    attributes: [
+        "email": .string("user@example.com"),
+        "plan": .string("enterprise"),
+        "subscribed": .boolean(true)
+    ]
+)
+
+try WtsSDK.shared.updateUser(
+    WtsUserUpdate(
+        set: ["plan": .string("business")],
+        setOnce: ["signup_channel": .string("partner")],
+        increment: ["lifetime_orders": 1]
+    )
+)
+
+try WtsSDK.shared.setReportedAttribution(
+    WtsReportedAttribution(
+        source: "newsletter",
+        medium: "email",
+        campaign: "summer_2026",
+        externalRef: "mailing-482"
+    )
+)
+```
+
+Call `resetIdentity()` on logout. It removes the current profile binding, rotates the anonymous/session context and preserves the installation identity used for deterministic mobile delivery. Identity mutations use a persistent FIFO queue and are flushed before events.
+
 ## Platform behavior
 
 - `handle(url:)` has a 2-second default timeout and a 100-entry/60-second memory cache.
 - Errors are typed and retain the original web fallback URL where applicable.
 - The install UUID is generated locally and stored in Keychain.
-- `getDeferredDeepLink()` intentionally returns `nil` on iOS in protocol V1.
+- `getDeferredDeepLink()` intentionally returns `nil` on iOS; deterministic post-install deferred attribution is not promised.
 - No IDFA, pasteboard attribution, GAID, fingerprinting, or automatic navigation.
 
 See the installable sample in `Examples/Quickstart`, [security policy](SECURITY.md), and [support policy](SUPPORT.md). Full integration documentation: https://wts.is/docs/sdk/ios
