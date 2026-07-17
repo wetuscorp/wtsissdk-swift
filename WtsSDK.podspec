@@ -1,7 +1,7 @@
 Pod::Spec.new do |s|
   s.name = 'WtsSDK'
-  s.version = '0.2.0-alpha.1'
-  s.summary = 'Official wts.is deep-link and attribution SDK.'
+  s.version = '0.3.0-alpha.1'
+  s.summary = 'Official wts.is deep-link, analytics, identity and Experiences SDK.'
   s.homepage = 'https://wts.is'
   s.license = { :type => 'Apache-2.0' }
   s.author = { 'Wetus' => 'info@wetus.co' }
