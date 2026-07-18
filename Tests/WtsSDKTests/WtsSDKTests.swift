@@ -198,12 +198,16 @@ final class WtsSDKTests: XCTestCase {
     let expiredFixture = try Self.signedContextualExperienceFixture(
       expiresAt: "2000-01-01T00:00:00.000Z"
     )
+    let wrongSourceFixture = try Self.signedContextualExperienceFixture(
+      sourceKey: "other-public-app-key"
+    )
 
     for (fixture, keys) in [
       (validFixture, [String: String]()),
       (invalidSignatureFixture, invalidSignatureFixture.verificationKeys),
       (validFixture, ["unknown-kid": validFixture.verificationKeys["experience-key-v1"]!]),
       (expiredFixture, expiredFixture.verificationKeys),
+      (wrongSourceFixture, wrongSourceFixture.verificationKeys),
     ] {
       let sdk = WtsSDK(
         transport: MockTransport { request in
@@ -244,10 +248,12 @@ final class WtsSDKTests: XCTestCase {
     XCTAssertTrue(publicKey.isValidSignature(signature, for: payload))
     let manifest = try JSONDecoder.wts.decode(ExperienceBootstrapResponse.Manifest.self, from: payload)
     XCTAssertEqual(manifest.sourceId, "source_mobile")
+    XCTAssertEqual(manifest.sourceKey, "public-app-key")
     XCTAssertNotNil(
       ExperienceManifestVerifier.verify(
         response: response,
         verificationKeys: fixture.verificationKeys,
+        expectedSourceKey: "public-app-key",
         decoder: .wts
       )
     )
@@ -731,6 +737,7 @@ final class WtsSDKTests: XCTestCase {
   private static func signedContextualExperienceFixture(
     rawManifest: [String: Any]? = nil,
     keyId: String = "experience-key-v1",
+    sourceKey: String = "public-app-key",
     expiresAt: String = "2099-01-01T00:00:00.000Z",
     signatureTampered: Bool = false
   ) throws -> SignedExperienceFixture {
@@ -738,6 +745,7 @@ final class WtsSDKTests: XCTestCase {
       """
       {
         "sourceId": "source_mobile",
+        "sourceKey": "\(sourceKey)",
         "sourceManifestVersion": 7,
         "environment": "production",
         "expiresAt": "\(expiresAt)",

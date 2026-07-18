@@ -126,10 +126,11 @@ try await WtsSDK.shared.setExperienceConsent(.contextual)
 Obtain the public verification-key map from
 `GET /api/v1/organizations/:organizationId/experiences/manifest-verification-keys`
 with an authenticated dashboard or Integration API request. Never copy a
-private signing key into an app. Use `.personalized` only after profile consent.
-`.pending` makes no Experience request; `.denied` clears local Experience state
-and unsent interactions. Automatic mode uses native modal or bottom-sheet
-presentation.
+private signing key into an app. The SDK uses only the signed payload and also
+requires its source key to match the configured app key. Use `.personalized`
+only after profile consent. `.pending` makes no Experience request; `.denied`
+clears local Experience state and unsent interactions. Automatic mode uses
+native modal or bottom-sheet presentation.
 
 Manual mode delivers each eligible `WtsExperienceManualPresentation` only once.
 The host renders it and acknowledges its lifecycle with the supplied handle:

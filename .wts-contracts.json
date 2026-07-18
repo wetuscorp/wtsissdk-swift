@@ -6,7 +6,7 @@
   "fixtureChecksum": "72e1d406927a7dc1181e4f9284fca580e50fc03e736379b4e585369c1ee3d535",
   "experiencesProtocolVersion": 1,
   "experiencesContractPath": "sdks/contracts/experiences/v1",
-  "experiencesFixtureChecksum": "810cb1710e5d5adbe9673601a5dccdbc80401be36514401a7d4f1045ab9a244c",
+  "experiencesFixtureChecksum": "78c7612527903063f7c9eb1f2ebdf1fd39c4a141fb78ccbd7b9a5a4474ea15b0",
   "identityProtocolVersion": 1,
   "identityContractPath": "sdks/contracts/identity/v1",
   "identityFixtureChecksum": "68a684ce22819418c9bee2b5330fffa6f3d284722b204eead8af0cbf28c6381a",

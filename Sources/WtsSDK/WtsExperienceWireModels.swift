@@ -47,7 +47,10 @@ struct ExperienceBootstrapResponse: Decodable {
       let assignment: Branch?
     }
 
+    /// Stable internal source identifier used for reporting and targeting.
     let sourceId: String
+    /// Public source/app key bound into the collector's signed payload.
+    let sourceKey: String
     let sourceManifestVersion: Int
     let environment: String
     let expiresAt: Date

@@ -8,6 +8,7 @@ enum ExperienceManifestVerifier {
   static func verify(
     response: ExperienceBootstrapResponse,
     verificationKeys: [String: String],
+    expectedSourceKey: String,
     decoder: JSONDecoder
   ) -> ExperienceBootstrapResponse.Manifest? {
     guard
@@ -22,7 +23,9 @@ enum ExperienceManifestVerifier {
         rawRepresentation: try ed25519RawKey(fromSPKIDER: publicKeyData)
       )
       guard publicKey.isValidSignature(signature, for: payload) else { return nil }
-      return try decoder.decode(ExperienceBootstrapResponse.Manifest.self, from: payload)
+      let manifest = try decoder.decode(ExperienceBootstrapResponse.Manifest.self, from: payload)
+      guard manifest.sourceKey == expectedSourceKey else { return nil }
+      return manifest
     } catch {
       return nil
     }

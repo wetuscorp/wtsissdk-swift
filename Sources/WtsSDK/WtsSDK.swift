@@ -1297,6 +1297,7 @@ public actor WtsSDK {
     guard let manifest = ExperienceManifestVerifier.verify(
       response: response,
       verificationKeys: options.experiences.manifestVerificationKeys,
+      expectedSourceKey: appKey,
       decoder: decoder
     ), manifest.expiresAt > Date() else {
       throw WtsSDKError.invalidResponse(fallbackURL: nil)
