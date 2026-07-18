@@ -1,8 +1,22 @@
 # Changelog
 
-> Entries for the `0.3.0-alpha.1` source line below are not a Swift Package or
-> CocoaPods publication claim. Consume SDK Test & Validate only from its
-> matching published SDK release.
+## 0.4.0-alpha.1
+
+- Verify Experience manifests with configured base64 SPKI DER Ed25519 public
+  keys before any manifest is parsed or used; unsigned compatibility payloads
+  now fail closed.
+- Bind each verified signed manifest to its configured source key and reject
+  unsafe or insecure Experience deep-link schemes even if a host allowlist is
+  misconfigured.
+- Gate personalized Experience decisions on a server-accepted `identify`
+  binding; contextual delivery remains available while identity is pending.
+- Added a manual-presentation handle and explicit render, impression, action,
+  dismiss, and render-failure lifecycle acknowledgements with idempotency and
+  stale-handle rejection.
+- Require an allowlisted host for HTTPS deep-link Experience actions; an
+  allowed custom scheme never authorizes an arbitrary HTTPS URL.
+- Preserve SDK Test & Validate as an isolated opt-in surface at
+  `0.4.0-alpha.1`.
 
 ## 0.3.0-alpha.1
 

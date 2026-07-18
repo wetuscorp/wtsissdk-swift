@@ -2,7 +2,7 @@
 
 Create an iOS 15+ SwiftUI app and add `WtsSDK` through either Swift Package Manager or CocoaPods. Use only one dependency manager for the application target.
 
-For Swift Package Manager, add `https://github.com/wetuscorp/wtsissdk-swift.git` in Xcode and select a matching published SDK version. SDK Test & Validate requires a published release that explicitly includes the `0.3.0-alpha.1` source-line APIs; this README does not imply a registry release exists.
+For Swift Package Manager, add `https://github.com/wetuscorp/wtsissdk-swift.git` in Xcode and select a matching published SDK version. SDK Test & Validate requires a published release that explicitly includes the `0.4.0-alpha.1` source-line APIs; this README does not imply a registry release exists.
 
 For CocoaPods, add the following dependency to the application target and run `bundle exec pod install`:
 

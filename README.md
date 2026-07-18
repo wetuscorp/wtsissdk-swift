@@ -2,12 +2,11 @@
 
 Official, source-based SDK for wts.is deep links and mobile attribution. It resolves verified Universal Links, returns an application-owned route, and queues registered custom events and revenue safely while offline. The SDK never navigates your UI.
 
-> `0.3.0-alpha.1` source line · Mobile Protocol V3 + Identity V1 + Experiences V1 + SDK Test Session V1 · iOS 15+ · Swift 5.9+
+> `0.4.0-alpha.1` prerelease · Mobile Protocol V3 + Identity V1 + Experiences V1 + SDK Test Session V1 · iOS 15+ · Swift 5.9+
 
-> **Release note:** SDK Test & Validate APIs below are source-line APIs. Use
-> them only after the matching Swift Package/CocoaPods release has been
-> published. This document does not claim that `0.3.0-alpha.1` is already
-> available through either registry.
+> **Prerelease:** Pin this exact version while evaluating the alpha. Public API
+> compatibility is maintained within this prerelease; production rollout should
+> follow the matching dashboard and SDK readiness checks.
 
 ## Installation
 
@@ -21,8 +20,8 @@ In Xcode choose **File → Add Package Dependencies** and enter:
 https://github.com/wetuscorp/wtsissdk-swift.git
 ```
 
-Select the matching published version that declares SDK Test Session V1 support,
-link the `WtsSDK` product to the application target, then:
+Select **Exact Version** and enter `0.4.0-alpha.1`, link the `WtsSDK` product
+to the application target, then:
 
 ```swift
 import WtsSDK
@@ -38,7 +37,7 @@ source 'https://cdn.cocoapods.org/'
 platform :ios, '15.0'
 
 target 'YourApp' do
-  pod 'WtsSDK', '<matching-published-version>'
+  pod 'WtsSDK', '0.4.0-alpha.1'
 end
 ```
 
@@ -109,6 +108,10 @@ var options = WtsOptions()
 options.experiences = WtsExperienceOptions(
     enabled: true,
     renderMode: .automatic,
+    // Fetch these public SPKI DER keys from the authenticated wts.is API.
+    manifestVerificationKeys: [
+        "active-kid": "BASE64_SPKI_DER_PUBLIC_KEY"
+    ],
     allowedInternalRoutes: ["/checkout", "/account"],
     allowedCallbackKeys: ["apply_offer"],
     allowedDeepLinkHosts: ["go.example.com"],
@@ -119,19 +122,58 @@ try await WtsSDK.shared.configure(appKey: "YOUR_PUBLIC_APP_KEY", options: option
 try await WtsSDK.shared.setExperienceConsent(.contextual)
 ```
 
-Use `.personalized` only after profile consent. `.pending` makes no Experience
-request; `.denied` clears local Experience state and unsent interactions.
-Automatic mode uses native modal or bottom-sheet presentation. Manual mode
-delivers an eligible `WtsExperience` through `onExperienceAvailable` and waits
-for `presentNextExperience()`. Application callbacks remain behind the
-configured allowlist.
+Obtain the public verification-key map from
+`GET /api/v1/organizations/:organizationId/experiences/manifest-verification-keys`
+with an authenticated dashboard or Integration API request. Never copy a
+private signing key into an app. The SDK uses only the signed payload and also
+requires its source key to match the configured app key. Use `.personalized`
+only after profile consent. `.pending` makes no Experience request; `.denied`
+clears local Experience state and unsent interactions. Automatic mode uses
+native modal or bottom-sheet presentation.
+
+Manual mode delivers each eligible `WtsExperienceManualPresentation` only once.
+The host renders it and acknowledges its lifecycle with the supplied handle:
+
+```swift
+await WtsSDK.shared.onExperienceAvailable { presentation in
+    // Render presentation.experience with the host UI.
+    Task {
+        let rendered = await WtsSDK.shared.acknowledgeExperienceRender(presentation.handle)
+        let impressed = await WtsSDK.shared.acknowledgeExperienceImpression(presentation.handle)
+        let action = await WtsSDK.shared.reportExperienceAction(
+            presentation.handle,
+            actionId: "continue"
+        )
+        let dismissed = await WtsSDK.shared.dismissExperience(presentation.handle)
+        _ = (rendered, impressed, action, dismissed)
+    }
+}
+```
+
+The handle is opaque and process-local: do not persist, log, or treat it as an
+authorization token. The SDK validates every lifecycle call against the active
+presentation, so forged or stale handles are rejected.
+
+`presentNextExperience()` and `dismissCurrentExperience()` are automatic-mode
+APIs and return no manual presentation. HTTPS deep-link actions always require
+an allowlisted host; `allowedDeepLinkSchemes` is for non-HTTPS custom schemes
+only. The unsafe scheme set (`about`, `blob`, `data`, `file`, `filesystem`,
+`http`, `javascript`, and `vbscript`) is rejected even when configured
+explicitly.
+Application callbacks remain behind the configured allowlist.
 
 Experience interactions use their own persistent, bounded FIFO queue and UUID
 idempotency. Impressions are emitted after one uninterrupted second of native
 visibility. `dismissCurrentExperience()` and
 `getExperienceDiagnostics()` provide lifecycle and integration control.
 
-To test an unpublished revision on this installation, read
+Personalized delivery requires both profile consent and a server-accepted
+`identify` binding for the configured source. Until that binding is ready, the
+SDK evaluates only signed contextual campaigns and never calls the personalized
+decision endpoint. Calling `resetIdentity()` or denying profile consent clears
+the local binding state immediately.
+
+To test a draft Experience revision on this installation, read
 `await WtsSDK.shared.getExperienceDiagnostics().testDeviceToken` and grant it
 to the matching Mobile App from the dashboard. The random source-scoped token
 contains no install, user, or profile identifier, and test traffic is excluded
