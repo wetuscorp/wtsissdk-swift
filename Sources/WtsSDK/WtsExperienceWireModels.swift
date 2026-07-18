@@ -53,10 +53,42 @@ struct ExperienceBootstrapResponse: Decodable {
     let expiresAt: Date
     let campaigns: [Campaign]
   }
-  let manifest: Manifest
+  /// The unsigned compatibility copy returned by the collector.
+  ///
+  /// It is decoded only so the response shape remains compatible with the
+  /// protocol. Runtime behavior must use the separately verified
+  /// `signedPayload`, never this value.
+  let manifest: ExperienceDiscardedJSONValue
+  let signedPayload: String
   let signature: String
   let keyId: String
-  let expiresAt: Date
+  let expiresAt: String
+}
+
+indirect enum ExperienceDiscardedJSONValue: Decodable {
+  case object([String: ExperienceDiscardedJSONValue])
+  case array([ExperienceDiscardedJSONValue])
+  case string(String)
+  case number(Double)
+  case bool(Bool)
+  case null
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.singleValueContainer()
+    if container.decodeNil() {
+      self = .null
+    } else if let value = try? container.decode(Bool.self) {
+      self = .bool(value)
+    } else if let value = try? container.decode(Double.self) {
+      self = .number(value)
+    } else if let value = try? container.decode(String.self) {
+      self = .string(value)
+    } else if let value = try? container.decode([String: ExperienceDiscardedJSONValue].self) {
+      self = .object(value)
+    } else {
+      self = .array(try container.decode([ExperienceDiscardedJSONValue].self))
+    }
+  }
 }
 
 struct ExperienceManifestTrigger: Decodable {

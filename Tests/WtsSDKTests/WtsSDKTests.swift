@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 
@@ -16,7 +17,8 @@ final class WtsSDKTests: XCTestCase {
     let sdk = WtsSDK(
       transport: transport,
       identity: StaticIdentity(),
-      store: MemoryEventStore()
+      store: MemoryEventStore(),
+      identityStore: MemoryIdentityMutationStore()
     )
     try await sdk.configure(appKey: "public-app-key")
     let url = try XCTUnwrap(URL(string: "https://demo.links.wts.is/summer"))
@@ -35,7 +37,8 @@ final class WtsSDKTests: XCTestCase {
     let sdk = WtsSDK(
       transport: MockTransport { _ in (Data(), 404) },
       identity: StaticIdentity(),
-      store: MemoryEventStore()
+      store: MemoryEventStore(),
+      identityStore: MemoryIdentityMutationStore()
     )
     try await sdk.configure(appKey: "public-app-key")
     let url = try XCTUnwrap(URL(string: "https://demo.links.wts.is/missing"))
@@ -54,7 +57,8 @@ final class WtsSDKTests: XCTestCase {
     let sdk = WtsSDK(
       transport: MockTransport { _ in (Self.emptyBatchFixture, 202) },
       identity: StaticIdentity(),
-      store: store
+      store: store,
+      identityStore: MemoryIdentityMutationStore()
     )
     try await sdk.configure(appKey: "public-app-key")
 
@@ -91,7 +95,8 @@ final class WtsSDKTests: XCTestCase {
     let sdk = WtsSDK(
       transport: transport,
       identity: StaticIdentity(),
-      store: store
+      store: store,
+      identityStore: MemoryIdentityMutationStore()
     )
     try await sdk.configure(appKey: "public-app-key")
 
@@ -108,7 +113,8 @@ final class WtsSDKTests: XCTestCase {
     let sdk = WtsSDK(
       transport: MockTransport { _ in (Self.emptyBatchFixture, 202) },
       identity: StaticIdentity(),
-      store: MemoryEventStore()
+      store: MemoryEventStore(),
+      identityStore: MemoryIdentityMutationStore()
     )
     try await sdk.configure(appKey: "public-app-key")
     let first = await sdk.getExperienceDiagnostics().testDeviceToken
@@ -121,10 +127,13 @@ final class WtsSDKTests: XCTestCase {
   }
 
   func testContextualExperienceUsesSignedBootstrapGrantWithoutDecisionRoundTrip() async throws {
+    let fixture = try Self.signedContextualExperienceFixture(
+      rawManifest: ["untrusted": true]
+    )
     let transport = MockTransport { request in
       switch request.url?.path {
       case "/experiences/v1/bootstrap":
-        return (Self.contextualExperienceBootstrapFixture, 200)
+        return (fixture.response, 200)
       case "/experiences/v1/interactions/batch":
         let body = try XCTUnwrap(request.httpBody)
         let json = try XCTUnwrap(
@@ -158,12 +167,17 @@ final class WtsSDKTests: XCTestCase {
       transport: transport,
       identity: StaticIdentity(),
       store: MemoryEventStore(),
+      identityStore: MemoryIdentityMutationStore(),
       experienceInteractionStore: MemoryExperienceInteractionStore()
     )
     try await sdk.configure(
       appKey: "public-app-key",
       options: WtsOptions(
-        experiences: WtsExperienceOptions(enabled: true, renderMode: .manual)
+        experiences: WtsExperienceOptions(
+          enabled: true,
+          renderMode: .manual,
+          manifestVerificationKeys: fixture.verificationKeys
+        )
       )
     )
 
@@ -176,6 +190,195 @@ final class WtsSDKTests: XCTestCase {
     XCTAssertEqual(paths.filter { $0 == "/experiences/v1/bootstrap" }.count, 1)
     XCTAssertFalse(paths.contains("/experiences/v1/decide"))
     XCTAssertEqual(diagnostics.queued, 1)
+  }
+
+  func testExperienceManifestFailsClosedForMissingKeyInvalidSignatureUnknownKeyAndExpiry() async throws {
+    let validFixture = try Self.signedContextualExperienceFixture()
+    let invalidSignatureFixture = try Self.signedContextualExperienceFixture(signatureTampered: true)
+    let expiredFixture = try Self.signedContextualExperienceFixture(
+      expiresAt: "2000-01-01T00:00:00.000Z"
+    )
+
+    for (fixture, keys) in [
+      (validFixture, [String: String]()),
+      (invalidSignatureFixture, invalidSignatureFixture.verificationKeys),
+      (validFixture, ["unknown-kid": validFixture.verificationKeys["experience-key-v1"]!]),
+      (expiredFixture, expiredFixture.verificationKeys),
+    ] {
+      let sdk = WtsSDK(
+        transport: MockTransport { request in
+          XCTAssertEqual(request.url?.path, "/experiences/v1/bootstrap")
+          return (fixture.response, 200)
+        },
+        identity: StaticIdentity(),
+        store: MemoryEventStore(),
+        identityStore: MemoryIdentityMutationStore()
+      )
+      try await sdk.configure(
+        appKey: "public-app-key",
+        options: WtsOptions(
+          experiences: WtsExperienceOptions(
+            enabled: true,
+            renderMode: .manual,
+            manifestVerificationKeys: keys
+          )
+        )
+      )
+
+      let result = try await sdk.setExperienceConsent(.contextual)
+      let diagnostics = await sdk.getExperienceDiagnostics()
+      XCTAssertEqual(result, .manifestVerificationFailed)
+      XCTAssertEqual(diagnostics.lastErrorCode, "EXPERIENCE_MANIFEST_VERIFICATION_FAILED")
+    }
+  }
+
+  func testExperienceVerifierAcceptsBase64SPKIDERAndUsesSignedPayload() throws {
+    let fixture = try Self.signedContextualExperienceFixture(rawManifest: ["untrusted": true])
+    let response = try JSONDecoder.wts.decode(ExperienceBootstrapResponse.self, from: fixture.response)
+    let payload = try XCTUnwrap(Data(base64URLEncoded: response.signedPayload))
+    let signature = try XCTUnwrap(Data(base64URLEncoded: response.signature))
+    let spki = try XCTUnwrap(Data(base64Encoded: fixture.verificationKeys[response.keyId]!))
+    let raw = Data(spki.dropFirst(12))
+    let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: raw)
+
+    XCTAssertTrue(publicKey.isValidSignature(signature, for: payload))
+    let manifest = try JSONDecoder.wts.decode(ExperienceBootstrapResponse.Manifest.self, from: payload)
+    XCTAssertEqual(manifest.sourceId, "source_mobile")
+    XCTAssertNotNil(
+      ExperienceManifestVerifier.verify(
+        response: response,
+        verificationKeys: fixture.verificationKeys,
+        decoder: .wts
+      )
+    )
+  }
+
+  func testManualExperienceLifecycleIsSingleDeliveryIdempotentAndRejectsStaleHandles() async throws {
+    let fixture = try Self.signedContextualExperienceFixture()
+    let recorder = ManualPresentationRecorder()
+    let sdk = WtsSDK(
+      transport: Self.experienceTransport(fixture: fixture),
+      identity: StaticIdentity(),
+      store: MemoryEventStore(),
+      identityStore: MemoryIdentityMutationStore(),
+      experienceInteractionStore: MemoryExperienceInteractionStore()
+    )
+    try await sdk.configure(
+      appKey: "public-app-key",
+      options: WtsOptions(
+        experiences: WtsExperienceOptions(
+          enabled: true,
+          renderMode: .manual,
+          manifestVerificationKeys: fixture.verificationKeys,
+          allowedDeepLinkHosts: ["allowed.example"]
+        )
+      )
+    )
+    await sdk.onExperienceAvailable { recorder.append($0) }
+
+    let consentResult = try await sdk.setExperienceConsent(.contextual)
+    XCTAssertEqual(consentResult, .accepted)
+    try await sdk.screen("checkout")
+
+    let presentation = try XCTUnwrap(recorder.last)
+    XCTAssertEqual(recorder.count, 1)
+    let automaticPresentation = await sdk.presentNextExperience()
+    let queuedDiagnostics = await sdk.getExperienceDiagnostics()
+    XCTAssertNil(automaticPresentation)
+    XCTAssertEqual(queuedDiagnostics.queued, 1)
+
+    let forged = WtsExperiencePresentationHandle(exposureId: "forged")
+    let forgedOutcome = await sdk.acknowledgeExperienceRender(forged)
+    let renderOutcome = await sdk.acknowledgeExperienceRender(presentation.handle)
+    let duplicateRenderOutcome = await sdk.acknowledgeExperienceRender(presentation.handle)
+    let impressionOutcome = await sdk.acknowledgeExperienceImpression(presentation.handle)
+    let duplicateImpressionOutcome = await sdk.acknowledgeExperienceImpression(presentation.handle)
+    let actionOutcome = await sdk.reportExperienceAction(presentation.handle, actionId: "continue")
+    let duplicateActionOutcome = await sdk.reportExperienceAction(
+      presentation.handle,
+      actionId: "continue"
+    )
+    let dismissalOutcome = await sdk.dismissExperience(presentation.handle)
+    let duplicateDismissalOutcome = await sdk.dismissExperience(presentation.handle)
+    let staleActionOutcome = await sdk.reportExperienceAction(
+      presentation.handle,
+      actionId: "continue"
+    )
+    XCTAssertEqual(forgedOutcome.code, "EXPERIENCE_PRESENTATION_NOT_FOUND")
+    XCTAssertTrue(renderOutcome.accepted)
+    XCTAssertTrue(duplicateRenderOutcome.idempotent)
+    XCTAssertTrue(impressionOutcome.accepted)
+    XCTAssertTrue(duplicateImpressionOutcome.idempotent)
+    XCTAssertTrue(actionOutcome.accepted)
+    XCTAssertTrue(duplicateActionOutcome.idempotent)
+    XCTAssertTrue(dismissalOutcome.accepted)
+    XCTAssertTrue(duplicateDismissalOutcome.idempotent)
+    XCTAssertEqual(staleActionOutcome.code, "EXPERIENCE_PRESENTATION_NOT_CURRENT")
+    XCTAssertEqual(recorder.count, 1)
+  }
+
+  func testHTTPSDeepLinkCannotBypassHostAllowlistWithSchemeAllowlist() async throws {
+    let fixture = try Self.signedContextualExperienceFixture()
+    let recorder = ManualPresentationRecorder()
+    let sdk = WtsSDK(
+      transport: Self.experienceTransport(fixture: fixture),
+      identity: StaticIdentity(),
+      store: MemoryEventStore(),
+      identityStore: MemoryIdentityMutationStore(),
+      experienceInteractionStore: MemoryExperienceInteractionStore()
+    )
+    try await sdk.configure(
+      appKey: "public-app-key",
+      options: WtsOptions(
+        experiences: WtsExperienceOptions(
+          enabled: true,
+          renderMode: .manual,
+          manifestVerificationKeys: fixture.verificationKeys,
+          allowedDeepLinkSchemes: ["https"]
+        )
+      )
+    )
+    await sdk.onExperienceAvailable { recorder.append($0) }
+    let consentResult = try await sdk.setExperienceConsent(.contextual)
+    XCTAssertEqual(consentResult, .accepted)
+    try await sdk.screen("checkout")
+
+    let presentation = try XCTUnwrap(recorder.last)
+    let renderOutcome = await sdk.acknowledgeExperienceRender(presentation.handle)
+    XCTAssertTrue(renderOutcome.accepted)
+    let outcome = await sdk.reportExperienceAction(presentation.handle, actionId: "continue")
+    XCTAssertFalse(outcome.accepted)
+    XCTAssertEqual(outcome.code, "EXPERIENCE_ACTION_NOT_ALLOWED")
+  }
+
+  func testPersonalizedExperienceStopsWhenProfileConsentIsDenied() async throws {
+    let fixture = try Self.signedContextualExperienceFixture()
+    let sdk = WtsSDK(
+      transport: Self.experienceTransport(fixture: fixture),
+      identity: StaticIdentity(),
+      store: MemoryEventStore(),
+      identityStore: MemoryIdentityMutationStore(),
+      experienceInteractionStore: MemoryExperienceInteractionStore()
+    )
+    try await sdk.configure(
+      appKey: "public-app-key",
+      options: WtsOptions(
+        experiences: WtsExperienceOptions(
+          enabled: true,
+          renderMode: .manual,
+          manifestVerificationKeys: fixture.verificationKeys
+        )
+      )
+    )
+    try await sdk.setProfileConsent(.granted)
+    let consentResult = try await sdk.setExperienceConsent(.personalized)
+    XCTAssertEqual(consentResult, .accepted)
+    try await sdk.setProfileConsent(.denied)
+
+    let diagnostics = await sdk.getExperienceDiagnostics()
+    XCTAssertEqual(diagnostics.consent, .pending)
+    XCTAssertEqual(diagnostics.queued, 0)
+    XCTAssertFalse(diagnostics.presenting)
   }
 
   func testCorruptedQueueIsQuarantinedAsEmpty() throws {
@@ -406,6 +609,7 @@ final class WtsSDKTests: XCTestCase {
       transport: transport,
       identity: StaticIdentity(),
       store: MemoryEventStore(),
+      identityStore: MemoryIdentityMutationStore(),
       testSessionStore: testStore
     )
     try await sdk.configure(
@@ -502,14 +706,24 @@ final class WtsSDKTests: XCTestCase {
     { "accepted": [], "duplicates": [], "rejected": [] }
     """.utf8)
 
-  private static let contextualExperienceBootstrapFixture = Data(
-    """
-    {
-      "manifest": {
+  private struct SignedExperienceFixture: Sendable {
+    let response: Data
+    let verificationKeys: [String: String]
+  }
+
+  private static func signedContextualExperienceFixture(
+    rawManifest: [String: Any]? = nil,
+    keyId: String = "experience-key-v1",
+    expiresAt: String = "2099-01-01T00:00:00.000Z",
+    signatureTampered: Bool = false
+  ) throws -> SignedExperienceFixture {
+    let payload = Data(
+      """
+      {
         "sourceId": "source_mobile",
         "sourceManifestVersion": 7,
         "environment": "production",
-        "expiresAt": "2099-01-01T00:00:00Z",
+        "expiresAt": "\(expiresAt)",
         "campaigns": [{
           "campaignId": "campaign_checkout",
           "campaignVersionId": "campaign_version_7",
@@ -532,7 +746,12 @@ final class WtsSDKTests: XCTestCase {
                 "tr": {
                   "title": "Siparişinizi tamamlayın",
                   "description": "Güvenli ödeme adımına devam edin.",
-                  "primaryAction": null,
+                  "primaryAction": {
+                    "id": "continue",
+                    "label": "Devam et",
+                    "type": "OPEN_DEEP_LINK",
+                    "target": "https://allowed.example/checkout"
+                  },
                   "secondaryAction": null
                 }
               },
@@ -551,12 +770,98 @@ final class WtsSDKTests: XCTestCase {
             "variantId": "variant_primary"
           }
         }]
-      },
-      "signature": "signed-manifest",
-      "keyId": "experience-key-v1",
-      "expiresAt": "2099-01-01T00:00:00Z"
+      }
+      """.utf8
+    )
+    let privateKey = Curve25519.Signing.PrivateKey()
+    var signature = try privateKey.signature(for: payload)
+    if signatureTampered {
+      signature[signature.startIndex] ^= 0x01
     }
-    """.utf8)
+    let signedManifest = try XCTUnwrap(JSONSerialization.jsonObject(with: payload))
+    let manifest = rawManifest ?? signedManifest
+    let response = try JSONSerialization.data(
+      withJSONObject: [
+        "manifest": manifest,
+        "signedPayload": payload.base64URLEncodedString,
+        "signature": signature.base64URLEncodedString,
+        "keyId": keyId,
+        "expiresAt": "untrusted-outer-expiry",
+      ]
+    )
+    var publicKeySPKIDER = Data([
+      0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ])
+    publicKeySPKIDER.append(privateKey.publicKey.rawRepresentation)
+    return SignedExperienceFixture(
+      response: response,
+      verificationKeys: [keyId: publicKeySPKIDER.base64EncodedString()]
+    )
+  }
+
+  private static func experienceTransport(fixture: SignedExperienceFixture) -> MockTransport {
+    MockTransport { request in
+      switch request.url?.path {
+      case "/experiences/v1/bootstrap":
+        return (fixture.response, 200)
+      case "/experiences/v1/interactions/batch", "/api/v1/sdk/v3/events/batch":
+        let body = try XCTUnwrap(request.httpBody)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let identifiers = ((json["interactions"] ?? json["events"]) as? [[String: Any]])?
+          .compactMap { $0["clientInteractionId"] as? String ?? $0["clientEventId"] as? String }
+          ?? []
+        return (
+          try JSONSerialization.data(withJSONObject: [
+            "accepted": identifiers,
+            "duplicates": [],
+            "rejected": [],
+          ]), 202
+        )
+      default:
+        XCTFail("Unexpected Experience request: \(request.url?.path ?? "nil")")
+        return (Data(), 404)
+      }
+    }
+  }
+}
+
+private extension Data {
+  var base64URLEncodedString: String {
+    base64EncodedString()
+      .replacingOccurrences(of: "+", with: "-")
+      .replacingOccurrences(of: "/", with: "_")
+      .replacingOccurrences(of: "=", with: "")
+  }
+
+  init?(base64URLEncoded value: String) {
+    var normalized = value.replacingOccurrences(of: "-", with: "+")
+      .replacingOccurrences(of: "_", with: "/")
+    normalized += String(repeating: "=", count: (4 - normalized.count % 4) % 4)
+    self.init(base64Encoded: normalized)
+  }
+}
+
+private final class ManualPresentationRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var presentations: [WtsExperienceManualPresentation] = []
+
+  func append(_ presentation: WtsExperienceManualPresentation) {
+    lock.lock()
+    presentations.append(presentation)
+    lock.unlock()
+  }
+
+  var count: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return presentations.count
+  }
+
+  var last: WtsExperienceManualPresentation? {
+    lock.lock()
+    defer { lock.unlock() }
+    return presentations.last
+  }
 }
 
 private actor MockTransport: HTTPTransport {

@@ -109,6 +109,10 @@ var options = WtsOptions()
 options.experiences = WtsExperienceOptions(
     enabled: true,
     renderMode: .automatic,
+    // Fetch these public SPKI DER keys from the authenticated wts.is API.
+    manifestVerificationKeys: [
+        "active-kid": "BASE64_SPKI_DER_PUBLIC_KEY"
+    ],
     allowedInternalRoutes: ["/checkout", "/account"],
     allowedCallbackKeys: ["apply_offer"],
     allowedDeepLinkHosts: ["go.example.com"],
@@ -119,12 +123,37 @@ try await WtsSDK.shared.configure(appKey: "YOUR_PUBLIC_APP_KEY", options: option
 try await WtsSDK.shared.setExperienceConsent(.contextual)
 ```
 
-Use `.personalized` only after profile consent. `.pending` makes no Experience
-request; `.denied` clears local Experience state and unsent interactions.
-Automatic mode uses native modal or bottom-sheet presentation. Manual mode
-delivers an eligible `WtsExperience` through `onExperienceAvailable` and waits
-for `presentNextExperience()`. Application callbacks remain behind the
-configured allowlist.
+Obtain the public verification-key map from
+`GET /api/v1/organizations/:organizationId/experiences/manifest-verification-keys`
+with an authenticated dashboard or Integration API request. Never copy a
+private signing key into an app. Use `.personalized` only after profile consent.
+`.pending` makes no Experience request; `.denied` clears local Experience state
+and unsent interactions. Automatic mode uses native modal or bottom-sheet
+presentation.
+
+Manual mode delivers each eligible `WtsExperienceManualPresentation` only once.
+The host renders it and acknowledges its lifecycle with the supplied handle:
+
+```swift
+await WtsSDK.shared.onExperienceAvailable { presentation in
+    // Render presentation.experience with the host UI.
+    Task {
+        let rendered = await WtsSDK.shared.acknowledgeExperienceRender(presentation.handle)
+        let impressed = await WtsSDK.shared.acknowledgeExperienceImpression(presentation.handle)
+        let action = await WtsSDK.shared.reportExperienceAction(
+            presentation.handle,
+            actionId: "continue"
+        )
+        let dismissed = await WtsSDK.shared.dismissExperience(presentation.handle)
+        _ = (rendered, impressed, action, dismissed)
+    }
+}
+```
+
+`presentNextExperience()` and `dismissCurrentExperience()` are automatic-mode
+APIs and return no manual presentation. HTTPS deep-link actions always require
+an allowlisted host; `allowedDeepLinkSchemes` is for non-HTTPS custom schemes
+only. Application callbacks remain behind the configured allowlist.
 
 Experience interactions use their own persistent, bounded FIFO queue and UUID
 idempotency. Impressions are emitted after one uninterrupted second of native

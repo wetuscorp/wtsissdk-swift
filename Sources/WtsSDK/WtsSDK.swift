@@ -6,7 +6,7 @@ import Foundation
 
 public actor WtsSDK {
   public static let shared = WtsSDK()
-  public static let version = "0.3.0-alpha.1"
+  public static let version = "0.4.0-alpha.1"
 
   private let transport: HTTPTransport
   private let identity: InstallIdentityProviding
@@ -30,7 +30,9 @@ public actor WtsSDK {
   private var experienceManifestRefreshAt: Date?
   private var experienceQueue: [WtsExperience] = []
   private var experienceGrants: [String: String] = [:]
-  private var experienceHandler: (@Sendable (WtsExperience) -> Void)?
+  private var manualExperienceStates: [String: ManualExperienceState] = [:]
+  private var offeredManualExperienceId: String?
+  private var experienceHandler: (@Sendable (WtsExperienceManualPresentation) -> Void)?
   private var experienceActionHandler: (@Sendable (WtsExperience, WtsExperienceAction) -> Bool)?
   private var experienceLastErrorCode: String?
   private var presentingExperience: WtsExperience?
@@ -40,6 +42,14 @@ public actor WtsSDK {
   private var testSessionLastErrorCode: String?
   private var testSessionRetryTask: Task<Void, Never>?
   private var testSessionRetryAttempt = 0
+
+  private struct ManualExperienceState: Sendable {
+    let experience: WtsExperience
+    var renderAcknowledged = false
+    var impressionAcknowledged = false
+    var actionIds = Set<String>()
+    var terminalReason: WtsExperienceDismissReason?
+  }
 
   public init() {
     transport = URLSessionTransport()
@@ -149,6 +159,10 @@ public actor WtsSDK {
       return
     }
     profileConsentGranted = false
+    if experienceConsent == .personalized {
+      experienceConsent = .pending
+      try clearExperienceRuntime(clearInteractionQueue: true)
+    }
     try identityStore.save([])
     guard appKey != nil else {
       identitySessionId = UUID().uuidString.lowercased()
@@ -316,22 +330,22 @@ public actor WtsSDK {
     experienceConsent = consent
     recordTestSessionSignal(type: "consent", outcome: "observed", feature: "experiences")
     if consent == .pending || consent == .denied {
-      experienceManifest = nil
-      experienceCandidateVersionIds = []
-      experienceManifestExpiresAt = nil
-      experienceManifestRefreshAt = nil
-      experienceQueue = []
-      experienceGrants = [:]
-      presentingExperience = nil
-      #if canImport(UIKit)
-        await MainActor.run {
-          WtsExperiencePresenter.dismissCurrent(notify: false)
-        }
-      #endif
-      try experienceInteractionStore.save([])
+      try clearExperienceRuntime(clearInteractionQueue: true)
       return .accepted
     }
-    try await refreshExperienceManifest()
+    guard !options.experiences.manifestVerificationKeys.isEmpty else {
+      try clearExperienceRuntime(clearInteractionQueue: false)
+      experienceLastErrorCode = "EXPERIENCE_MANIFEST_VERIFICATION_FAILED"
+      return .manifestVerificationFailed
+    }
+    do {
+      try await refreshExperienceManifest()
+    } catch let error as WtsSDKError {
+      guard case .invalidResponse = error else { throw error }
+      try clearExperienceRuntime(clearInteractionQueue: false)
+      experienceLastErrorCode = "EXPERIENCE_MANIFEST_VERIFICATION_FAILED"
+      return .manifestVerificationFailed
+    }
     do {
       try await flushExperienceInteractions()
     } catch {
@@ -341,9 +355,10 @@ public actor WtsSDK {
   }
 
   public func onExperienceAvailable(
-    _ handler: (@Sendable (WtsExperience) -> Void)?
+    _ handler: (@Sendable (WtsExperienceManualPresentation) -> Void)?
   ) {
     experienceHandler = handler
+    notifyNextManualExperienceIfAvailable()
   }
 
   public func onExperienceAction(
@@ -353,25 +368,157 @@ public actor WtsSDK {
   }
 
   public func presentNextExperience() async -> WtsExperience? {
+    guard options.experiences.renderMode == .automatic else { return nil }
     guard presentingExperience == nil, !experienceQueue.isEmpty,
       experienceSessionImpressions < 2
     else { return nil }
     let experience = experienceQueue.removeFirst()
-    if options.experiences.renderMode == .manual {
-      experienceHandler?(experience)
-      return experience
-    }
     await presentAutomatically(experience)
     return experience
   }
 
   public func dismissCurrentExperience() {
+    guard options.experiences.renderMode == .automatic else { return }
     guard presentingExperience != nil else { return }
     #if canImport(UIKit)
       Task { @MainActor in WtsExperiencePresenter.dismissCurrent() }
     #else
       presentingExperience = nil
     #endif
+  }
+
+  /// Acknowledges that the host has begun rendering a manual Experience.
+  public func acknowledgeExperienceRender(
+    _ handle: WtsExperiencePresentationHandle
+  ) async -> WtsExperienceLifecycleOutcome {
+    guard isManualExperienceRuntimeEnabled else {
+      return manualExperienceUnavailableOutcome
+    }
+    guard var state = manualExperienceStates[handle.exposureId] else {
+      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_FOUND")
+    }
+    if state.renderAcknowledged {
+      return .init(accepted: true, idempotent: true)
+    }
+    guard state.terminalReason == nil,
+      presentingExperience == nil,
+      experienceQueue.first?.exposureId == handle.exposureId
+    else {
+      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_CURRENT")
+    }
+    experienceQueue.removeFirst()
+    offeredManualExperienceId = nil
+    state.renderAcknowledged = true
+    manualExperienceStates[handle.exposureId] = state
+    presentingExperience = state.experience
+    await recordExperience(state.experience, type: "render_started")
+    await recordExperience(state.experience, type: "render_succeeded")
+    return .init(accepted: true)
+  }
+
+  /// Records a visibility-qualified impression for a manual Experience.
+  public func acknowledgeExperienceImpression(
+    _ handle: WtsExperiencePresentationHandle
+  ) async -> WtsExperienceLifecycleOutcome {
+    guard isManualExperienceRuntimeEnabled else {
+      return manualExperienceUnavailableOutcome
+    }
+    guard var state = manualExperienceStates[handle.exposureId] else {
+      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_FOUND")
+    }
+    if state.impressionAcknowledged {
+      return .init(accepted: true, idempotent: true)
+    }
+    guard state.renderAcknowledged,
+      presentingExperience?.exposureId == handle.exposureId,
+      state.terminalReason == nil
+    else {
+      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_CURRENT")
+    }
+    state.impressionAcknowledged = true
+    manualExperienceStates[handle.exposureId] = state
+    experienceSessionImpressions += 1
+    await recordExperience(state.experience, type: "impression")
+    return .init(accepted: true)
+  }
+
+  /// Records a validated host-handled action for a manual Experience.
+  public func reportExperienceAction(
+    _ handle: WtsExperiencePresentationHandle,
+    actionId: String
+  ) async -> WtsExperienceLifecycleOutcome {
+    guard isManualExperienceRuntimeEnabled else {
+      return manualExperienceUnavailableOutcome
+    }
+    guard var state = manualExperienceStates[handle.exposureId] else {
+      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_FOUND")
+    }
+    guard state.renderAcknowledged,
+      presentingExperience?.exposureId == handle.exposureId,
+      state.terminalReason == nil
+    else {
+      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_CURRENT")
+    }
+    if state.actionIds.contains(actionId) {
+      return .init(accepted: true, idempotent: true)
+    }
+    guard let action = experienceAction(state.experience, id: actionId) else {
+      return .init(accepted: false, code: "EXPERIENCE_ACTION_INVALID")
+    }
+    guard isExperienceActionAllowed(action) else {
+      experienceLastErrorCode = "EXPERIENCE_ACTION_NOT_ALLOWED"
+      return .init(accepted: false, code: "EXPERIENCE_ACTION_NOT_ALLOWED")
+    }
+    state.actionIds.insert(action.id)
+    manualExperienceStates[handle.exposureId] = state
+    await recordExperience(
+      state.experience,
+      type: isPrimaryExperienceAction(state.experience, id: action.id)
+        ? "primary_action" : "secondary_action",
+      actionId: action.id
+    )
+    if action.isNavigationAction { clearQueuedExperiences() }
+    return .init(accepted: true)
+  }
+
+  /// Terminates a manual Experience presentation. Render failures require a
+  /// stable failure code so they remain diagnosable without leaking host data.
+  public func dismissExperience(
+    _ handle: WtsExperiencePresentationHandle,
+    reason: WtsExperienceDismissReason = .dismissed,
+    failureCode: String? = nil
+  ) async -> WtsExperienceLifecycleOutcome {
+    guard isManualExperienceRuntimeEnabled else {
+      return manualExperienceUnavailableOutcome
+    }
+    guard var state = manualExperienceStates[handle.exposureId] else {
+      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_FOUND")
+    }
+    if state.terminalReason == reason {
+      return .init(accepted: true, idempotent: true)
+    }
+    guard state.renderAcknowledged,
+      presentingExperience?.exposureId == handle.exposureId,
+      state.terminalReason == nil
+    else {
+      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_CURRENT")
+    }
+    guard reason != .renderFailed || !(failureCode?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) else {
+      return .init(accepted: false, code: "EXPERIENCE_FAILURE_CODE_REQUIRED")
+    }
+    state.terminalReason = reason
+    manualExperienceStates[handle.exposureId] = state
+    presentingExperience = nil
+    switch reason {
+    case .dismissed:
+      await recordExperience(state.experience, type: "dismissed")
+    case .autoClosed:
+      await recordExperience(state.experience, type: "auto_closed")
+    case .renderFailed:
+      await recordExperience(state.experience, type: "render_failed", failureCode: failureCode)
+    }
+    scheduleNextManualExperienceAfterCooldown()
+    return .init(accepted: true)
   }
 
   public func getExperienceDiagnostics() -> WtsExperienceDiagnostics {
@@ -383,6 +530,73 @@ public actor WtsSDK {
       testDeviceToken: experienceTestDeviceToken,
       lastErrorCode: experienceLastErrorCode
     )
+  }
+
+  private func clearExperienceRuntime(clearInteractionQueue: Bool) throws {
+    experienceManifest = nil
+    experienceCandidateVersionIds = []
+    experienceManifestExpiresAt = nil
+    experienceManifestRefreshAt = nil
+    experienceGrants = [:]
+    clearQueuedExperiences()
+    manualExperienceStates.removeAll()
+    presentingExperience = nil
+    #if canImport(UIKit)
+      Task { @MainActor in WtsExperiencePresenter.dismissCurrent(notify: false) }
+    #endif
+    if clearInteractionQueue {
+      try experienceInteractionStore.save([])
+    }
+  }
+
+  private func clearQueuedExperiences() {
+    for experience in experienceQueue {
+      manualExperienceStates.removeValue(forKey: experience.exposureId)
+    }
+    experienceQueue = []
+    offeredManualExperienceId = nil
+  }
+
+  private var isManualExperienceRuntimeEnabled: Bool {
+    options.experiences.enabled
+      && options.experiences.renderMode == .manual
+      && (experienceConsent == .contextual || experienceConsent == .personalized)
+      && (experienceConsent != .personalized || profileConsentGranted)
+  }
+
+  private var manualExperienceUnavailableOutcome: WtsExperienceLifecycleOutcome {
+    if !options.experiences.enabled {
+      return .init(accepted: false, code: "EXPERIENCE_FEATURE_DISABLED")
+    }
+    if options.experiences.renderMode != .manual {
+      return .init(accepted: false, code: "EXPERIENCE_MANUAL_MODE_REQUIRED")
+    }
+    if experienceConsent == .personalized, !profileConsentGranted {
+      return .init(accepted: false, code: "EXPERIENCE_PROFILE_CONSENT_REQUIRED")
+    }
+    return .init(accepted: false, code: "EXPERIENCE_CONSENT_REQUIRED")
+  }
+
+  private func notifyNextManualExperienceIfAvailable() {
+    guard isManualExperienceRuntimeEnabled, presentingExperience == nil,
+      let handler = experienceHandler,
+      let next = experienceQueue.first,
+      offeredManualExperienceId != next.exposureId
+    else { return }
+    offeredManualExperienceId = next.exposureId
+    handler(
+      WtsExperienceManualPresentation(
+        experience: next,
+        handle: WtsExperiencePresentationHandle(exposureId: next.exposureId)
+      )
+    )
+  }
+
+  private func scheduleNextManualExperienceAfterCooldown() {
+    Task { [weak self] in
+      try? await Task.sleep(nanoseconds: 3_000_000_000)
+      await self?.notifyNextManualExperienceIfAvailable()
+    }
   }
 
   /**
@@ -1064,6 +1278,9 @@ public actor WtsSDK {
 
   private func refreshExperienceManifest() async throws {
     guard let appKey else { throw WtsSDKError.notConfigured }
+    guard experienceConsent != .personalized || profileConsentGranted else {
+      throw WtsSDKError.experienceProfileConsentRequired
+    }
     let response: ExperienceBootstrapResponse = try await postExperience(
       path: "experiences/v1/bootstrap",
       sourceKey: appKey,
@@ -1077,16 +1294,18 @@ public actor WtsSDK {
         testDeviceToken: experienceTestDeviceToken
       )
     )
-    guard response.expiresAt > Date(), response.manifest.expiresAt == response.expiresAt,
-      !response.signature.isEmpty, !response.keyId.isEmpty
-    else {
+    guard let manifest = ExperienceManifestVerifier.verify(
+      response: response,
+      verificationKeys: options.experiences.manifestVerificationKeys,
+      decoder: decoder
+    ), manifest.expiresAt > Date() else {
       throw WtsSDKError.invalidResponse(fallbackURL: nil)
     }
-    experienceManifest = response.manifest
-    experienceCandidateVersionIds = response.manifest.campaigns.map(\.campaignVersionId)
-    experienceManifestExpiresAt = response.expiresAt
+    experienceManifest = manifest
+    experienceCandidateVersionIds = manifest.campaigns.map(\.campaignVersionId)
+    experienceManifestExpiresAt = manifest.expiresAt
     experienceManifestRefreshAt = min(
-      response.expiresAt,
+      manifest.expiresAt,
       Date().addingTimeInterval(5 * 60)
     )
     experienceLastErrorCode = nil
@@ -1094,7 +1313,8 @@ public actor WtsSDK {
 
   private func evaluateExperiences(context: ExperienceContextWire) async {
     guard options.experiences.enabled,
-      experienceConsent == .contextual || experienceConsent == .personalized
+      experienceConsent == .contextual || experienceConsent == .personalized,
+      experienceConsent != .personalized || profileConsentGranted
     else { return }
     do {
       if experienceManifestRefreshAt == nil || experienceManifestRefreshAt! <= Date() {
@@ -1156,12 +1376,18 @@ public actor WtsSDK {
         else { continue }
         experienceGrants[experience.assignmentId] = decision.grant
         experienceQueue.append(experience)
+        if options.experiences.renderMode == .manual {
+          manualExperienceStates[experience.exposureId] = ManualExperienceState(experience: experience)
+        }
         experienceQueue.sort {
           $0.priority == $1.priority
             ? $0.campaignId < $1.campaignId
             : $0.priority > $1.priority
         }
-        if experienceQueue.count > 5 { experienceQueue.removeLast() }
+        if experienceQueue.count > 5 {
+          let dropped = experienceQueue.removeLast()
+          manualExperienceStates.removeValue(forKey: dropped.exposureId)
+        }
         for type in ["assigned_variant", "eligible", "queued"] {
           interactions.append(
             experienceInteraction(
@@ -1171,9 +1397,6 @@ public actor WtsSDK {
               triggerEventId: context.triggerEventId
             )
           )
-        }
-        if options.experiences.renderMode == .manual {
-          experienceHandler?(experience)
         }
       }
       if !interactions.isEmpty {
@@ -1185,6 +1408,8 @@ public actor WtsSDK {
       }
       if options.experiences.renderMode == .automatic {
         _ = await presentNextExperience()
+      } else {
+        notifyNextManualExperienceIfAvailable()
       }
     } catch let error as WtsSDKError {
       experienceLastErrorCode = error.code
@@ -1401,18 +1626,13 @@ public actor WtsSDK {
     }
     let handled = experienceActionHandler?(experience, action) ?? false
     if !handled { await performSafeExperienceAction(action) }
-    let content = experience.content.translations.values.first
-    let primary = content?.primaryAction?.id == action.id
     await recordExperience(
       experience,
-      type: primary ? "primary_action" : "secondary_action",
+      type: isPrimaryExperienceAction(experience, id: action.id)
+        ? "primary_action" : "secondary_action",
       actionId: action.id
     )
-    if action.type == .openInternalRoute || action.type == .openDeepLink
-      || action.type == .openWebURL
-    {
-      experienceQueue.removeAll()
-    }
+    if action.isNavigationAction { clearQueuedExperiences() }
   }
 
   private func isExperienceActionAllowed(_ action: WtsExperienceAction) -> Bool {
@@ -1444,11 +1664,12 @@ public actor WtsSDK {
         let url = URL(string: target),
         let scheme = url.scheme?.lowercased()
       else { return false }
+      if scheme == "https" {
+        return url.host.map {
+          options.experiences.allowedDeepLinkHosts.contains($0.lowercased())
+        } == true
+      }
       return options.experiences.allowedDeepLinkSchemes.contains(scheme)
-        || (scheme == "https"
-          && url.host.map {
-            options.experiences.allowedDeepLinkHosts.contains($0.lowercased())
-          } == true)
     }
   }
 
@@ -1476,13 +1697,17 @@ public actor WtsSDK {
       #endif
     case .openDeepLink:
       guard let url = URL(string: target),
-        let scheme = url.scheme?.lowercased(),
-        options.experiences.allowedDeepLinkSchemes.contains(scheme)
-          || (scheme == "https"
-            && url.host.map {
-              options.experiences.allowedDeepLinkHosts.contains($0.lowercased())
-            } == true)
+        let scheme = url.scheme?.lowercased()
       else { return }
+      let allowed: Bool
+      if scheme == "https" {
+        allowed = url.host.map {
+          options.experiences.allowedDeepLinkHosts.contains($0.lowercased())
+        } == true
+      } else {
+        allowed = options.experiences.allowedDeepLinkSchemes.contains(scheme)
+      }
+      guard allowed else { return }
       #if canImport(UIKit)
         await MainActor.run { UIApplication.shared.open(url) }
       #endif
@@ -1863,6 +2088,27 @@ private func experienceValueMatches(
     }
   default:
     return false
+  }
+}
+
+private func experienceAction(
+  _ experience: WtsExperience,
+  id: String
+) -> WtsExperienceAction? {
+  for content in experience.content.translations.values {
+    if content.primaryAction?.id == id { return content.primaryAction }
+    if content.secondaryAction?.id == id { return content.secondaryAction }
+  }
+  return nil
+}
+
+private func isPrimaryExperienceAction(_ experience: WtsExperience, id: String) -> Bool {
+  experience.content.translations.values.contains { $0.primaryAction?.id == id }
+}
+
+private extension WtsExperienceAction {
+  var isNavigationAction: Bool {
+    type == .openInternalRoute || type == .openDeepLink || type == .openWebURL
   }
 }
 
