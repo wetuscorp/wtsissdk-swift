@@ -1665,6 +1665,7 @@ public actor WtsSDK {
         let url = URL(string: target),
         let scheme = url.scheme?.lowercased()
       else { return false }
+      guard !isUnsafeExperienceScheme(scheme) else { return false }
       if scheme == "https" {
         return url.host.map {
           options.experiences.allowedDeepLinkHosts.contains($0.lowercased())
@@ -1700,6 +1701,7 @@ public actor WtsSDK {
       guard let url = URL(string: target),
         let scheme = url.scheme?.lowercased()
       else { return }
+      guard !isUnsafeExperienceScheme(scheme) else { return }
       let allowed: Bool
       if scheme == "https" {
         allowed = url.host.map {
@@ -1713,6 +1715,11 @@ public actor WtsSDK {
         await MainActor.run { UIApplication.shared.open(url) }
       #endif
     }
+  }
+
+  private func isUnsafeExperienceScheme(_ scheme: String) -> Bool {
+    ["about", "blob", "data", "file", "filesystem", "http", "javascript", "vbscript"]
+      .contains(scheme)
   }
 
   private func experienceInteraction(

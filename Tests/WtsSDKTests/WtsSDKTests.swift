@@ -374,6 +374,44 @@ final class WtsSDKTests: XCTestCase {
     XCTAssertEqual(outcome.code, "EXPERIENCE_ACTION_NOT_ALLOWED")
   }
 
+  func testUnsafeDeepLinkSchemesCannotBypassExplicitAllowlist() async throws {
+    for scheme in ["about", "blob", "data", "file", "filesystem", "http", "javascript", "vbscript"] {
+      let fixture = try Self.signedContextualExperienceFixture(
+        deepLinkTarget: "\(scheme):unsafe"
+      )
+      let recorder = ManualPresentationRecorder()
+      let sdk = WtsSDK(
+        transport: Self.experienceTransport(fixture: fixture),
+        identity: StaticIdentity(),
+        store: MemoryEventStore(),
+        identityStore: MemoryIdentityMutationStore(),
+        experienceInteractionStore: MemoryExperienceInteractionStore()
+      )
+      try await sdk.configure(
+        appKey: "public-app-key",
+        options: WtsOptions(
+          experiences: WtsExperienceOptions(
+            enabled: true,
+            renderMode: .manual,
+            manifestVerificationKeys: fixture.verificationKeys,
+            allowedDeepLinkSchemes: [scheme]
+          )
+        )
+      )
+      await sdk.onExperienceAvailable { recorder.append($0) }
+      let consentResult = try await sdk.setExperienceConsent(.contextual)
+      XCTAssertEqual(consentResult, .accepted)
+      try await sdk.screen("checkout")
+
+      let presentation = try XCTUnwrap(recorder.last)
+      let renderOutcome = await sdk.acknowledgeExperienceRender(presentation.handle)
+      XCTAssertTrue(renderOutcome.accepted)
+      let outcome = await sdk.reportExperienceAction(presentation.handle, actionId: "continue")
+      XCTAssertFalse(outcome.accepted, "\(scheme) must be rejected even when allowlisted")
+      XCTAssertEqual(outcome.code, "EXPERIENCE_ACTION_NOT_ALLOWED")
+    }
+  }
+
   func testPersonalizedExperienceStopsWhenProfileConsentIsDenied() async throws {
     let fixture = try Self.signedContextualExperienceFixture()
     let sdk = WtsSDK(
@@ -738,6 +776,7 @@ final class WtsSDKTests: XCTestCase {
     rawManifest: [String: Any]? = nil,
     keyId: String = "experience-key-v1",
     sourceKey: String = "public-app-key",
+    deepLinkTarget: String = "https://allowed.example/checkout",
     expiresAt: String = "2099-01-01T00:00:00.000Z",
     signatureTampered: Bool = false
   ) throws -> SignedExperienceFixture {
@@ -775,7 +814,7 @@ final class WtsSDKTests: XCTestCase {
                     "id": "continue",
                     "label": "Devam et",
                     "type": "OPEN_DEEP_LINK",
-                    "target": "https://allowed.example/checkout"
+                    "target": "\(deepLinkTarget)"
                   },
                   "secondaryAction": null
                 }
@@ -834,6 +873,19 @@ final class WtsSDKTests: XCTestCase {
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         let identifiers = ((json["interactions"] ?? json["events"]) as? [[String: Any]])?
           .compactMap { $0["clientInteractionId"] as? String ?? $0["clientEventId"] as? String }
+          ?? []
+        return (
+          try JSONSerialization.data(withJSONObject: [
+            "accepted": identifiers,
+            "duplicates": [],
+            "rejected": [],
+          ]), 202
+        )
+      case "/api/v1/sdk/v2/identity/mutations":
+        let body = try XCTUnwrap(request.httpBody)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let identifiers = (json["mutations"] as? [[String: Any]])?
+          .compactMap { $0["clientMutationId"] as? String }
           ?? []
         return (
           try JSONSerialization.data(withJSONObject: [

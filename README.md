@@ -158,7 +158,10 @@ presentation, so forged or stale handles are rejected.
 `presentNextExperience()` and `dismissCurrentExperience()` are automatic-mode
 APIs and return no manual presentation. HTTPS deep-link actions always require
 an allowlisted host; `allowedDeepLinkSchemes` is for non-HTTPS custom schemes
-only. Application callbacks remain behind the configured allowlist.
+only. Browser and filesystem schemes (`javascript`, `data`, `file`, `vbscript`,
+`about`, `blob`, and `filesystem`) are rejected even if included in host
+configuration. This includes `http`, even when it is configured explicitly.
+Application callbacks remain behind the configured allowlist.
 
 Experience interactions use their own persistent, bounded FIFO queue and UUID
 idempotency. Impressions are emitted after one uninterrupted second of native

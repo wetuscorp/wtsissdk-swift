@@ -9,8 +9,9 @@
       "type": "object",
       "required": ["sourceKey"],
       "properties": {
-        "sourceKey": { "type": "string", "minLength": 1 }
-      }
+        "sourceKey": { "type": "string", "minLength": 1, "maxLength": 256 }
+      },
+      "additionalProperties": true
     },
     "signedPayload": { "type": "string", "minLength": 1 },
     "signature": { "type": "string" },
