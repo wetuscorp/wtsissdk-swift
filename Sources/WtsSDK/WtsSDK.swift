@@ -12,6 +12,7 @@ public actor WtsSDK {
   private let identity: InstallIdentityProviding
   private let store: EventStoring
   private let identityStore: IdentityMutationStoring
+  private let identityBindingStore: IdentityBindingStoring
   private let experienceInteractionStore: ExperienceInteractionStoring
   private let testSessionStore: TestSessionStoring
   private let encoder = JSONEncoder.wts
@@ -22,6 +23,7 @@ public actor WtsSDK {
   private var retryAttempt = 0
   private var retryTask: Task<Void, Never>?
   private var profileConsentGranted = false
+  private var identityBound = false
   private var identitySessionId = UUID().uuidString.lowercased()
   private var experienceConsent: WtsExperienceConsent = .pending
   private var experienceManifest: ExperienceBootstrapResponse.Manifest?
@@ -56,6 +58,7 @@ public actor WtsSDK {
     identity = KeychainInstallIdentity()
     store = FileEventStore()
     identityStore = FileIdentityMutationStore()
+    identityBindingStore = FileIdentityBindingStore()
     experienceInteractionStore = FileExperienceInteractionStore()
     testSessionStore = FileTestSessionStore()
   }
@@ -65,6 +68,7 @@ public actor WtsSDK {
     identity: InstallIdentityProviding,
     store: EventStoring,
     identityStore: IdentityMutationStoring = FileIdentityMutationStore(),
+    identityBindingStore: IdentityBindingStoring = FileIdentityBindingStore(),
     experienceInteractionStore: ExperienceInteractionStoring =
       FileExperienceInteractionStore(),
     testSessionStore: TestSessionStoring = FileTestSessionStore()
@@ -73,6 +77,7 @@ public actor WtsSDK {
     self.identity = identity
     self.store = store
     self.identityStore = identityStore
+    self.identityBindingStore = identityBindingStore
     self.experienceInteractionStore = experienceInteractionStore
     self.testSessionStore = testSessionStore
   }
@@ -85,6 +90,7 @@ public actor WtsSDK {
     }
     self.appKey = normalized
     self.options = options
+    identityBound = (try? identityBindingStore.load())?.sourceKey == normalized
     cache.removeAll()
     if let restored = try? testSessionStore.load(),
       restored.sourceKey == normalized,
@@ -159,6 +165,7 @@ public actor WtsSDK {
       return
     }
     profileConsentGranted = false
+    try setIdentityBound(false)
     if experienceConsent == .personalized {
       experienceConsent = .pending
       try clearExperienceRuntime(clearInteractionQueue: true)
@@ -215,6 +222,7 @@ public actor WtsSDK {
 
   public func resetIdentity() throws {
     try requireProfileConsent()
+    try setIdentityBound(false)
     try enqueueIdentity(type: "reset_identity")
     identitySessionId = UUID().uuidString.lowercased()
   }
@@ -936,6 +944,10 @@ public actor WtsSDK {
           + response.duplicates
           + response.rejected.filter { !$0.retryable }.map(\.clientMutationId)
       )
+      try updateIdentityBinding(
+        afterApplying: batch,
+        acceptedOrDuplicate: Set(response.accepted + response.duplicates)
+      )
       let remaining = queue.filter { !terminal.contains($0.clientMutationId) }
       try identityStore.save(remaining)
       if response.rejected.contains(where: \.retryable) {
@@ -957,6 +969,36 @@ public actor WtsSDK {
   private func configuredAppKey() throws -> String {
     guard let appKey else { throw WtsSDKError.notConfigured }
     return appKey
+  }
+
+  private var effectiveExperienceConsent: WtsExperienceConsent {
+    experienceConsent == .personalized && !identityBound ? .contextual : experienceConsent
+  }
+
+  private func updateIdentityBinding(
+    afterApplying mutations: [IdentityMutationRequest],
+    acceptedOrDuplicate: Set<String>
+  ) throws {
+    for mutation in mutations where acceptedOrDuplicate.contains(mutation.clientMutationId) {
+      switch mutation.type {
+      case "identify":
+        try setIdentityBound(true)
+      case "reset_identity":
+        try setIdentityBound(false)
+      default:
+        continue
+      }
+    }
+  }
+
+  private func setIdentityBound(_ bound: Bool) throws {
+    guard bound else {
+      try identityBindingStore.clear()
+      identityBound = false
+      return
+    }
+    try identityBindingStore.save(.init(sourceKey: try configuredAppKey()))
+    identityBound = true
   }
 
   private func activeTestSession() -> PersistedTestSession? {
@@ -1281,11 +1323,12 @@ public actor WtsSDK {
     guard experienceConsent != .personalized || profileConsentGranted else {
       throw WtsSDKError.experienceProfileConsentRequired
     }
+    let deliveryConsent = effectiveExperienceConsent
     let response: ExperienceBootstrapResponse = try await postExperience(
       path: "experiences/v1/bootstrap",
       sourceKey: appKey,
       body: ExperienceBootstrapRequest(
-        consent: experienceConsent,
+        consent: deliveryConsent,
         profileConsentGranted: profileConsentGranted,
         actorId: try identity.value(),
         sessionId: identitySessionId,
@@ -1321,18 +1364,25 @@ public actor WtsSDK {
       if experienceManifestRefreshAt == nil || experienceManifestRefreshAt! <= Date() {
         try await refreshExperienceManifest()
       }
+      if experienceConsent == .personalized, !identityBound {
+        do {
+          try await flushIdentity()
+        } catch {
+          scheduleRetry()
+        }
+      }
+      let deliveryConsent = effectiveExperienceConsent
       let decisions: [ExperienceDecisionResponse.Decision]
-      if experienceConsent == .contextual {
+      if deliveryConsent == .contextual {
         guard let manifest = experienceManifest else { return }
         decisions = contextualExperienceDecisions(manifest: manifest, context: context)
       } else {
-        try await flushIdentity()
         guard let appKey, !experienceCandidateVersionIds.isEmpty else { return }
         let response: ExperienceDecisionResponse = try await postExperience(
           path: "experiences/v1/decide",
           sourceKey: appKey,
           body: ExperienceDecisionRequest(
-            consent: experienceConsent,
+            consent: deliveryConsent,
             profileConsentGranted: profileConsentGranted,
             actorId: try identity.value(),
             sessionId: identitySessionId,
@@ -1490,7 +1540,7 @@ public actor WtsSDK {
     while batch.count > 1
       && encodedSize(
         ExperienceInteractionBatchRequest(
-          consent: experienceConsent,
+          consent: effectiveExperienceConsent,
           profileConsentGranted: profileConsentGranted,
           actorId: actorId,
           sessionId: identitySessionId,
@@ -1505,7 +1555,7 @@ public actor WtsSDK {
         path: "experiences/v1/interactions/batch",
         sourceKey: appKey,
         body: ExperienceInteractionBatchRequest(
-          consent: experienceConsent,
+          consent: effectiveExperienceConsent,
           profileConsentGranted: profileConsentGranted,
           actorId: actorId,
           sessionId: identitySessionId,

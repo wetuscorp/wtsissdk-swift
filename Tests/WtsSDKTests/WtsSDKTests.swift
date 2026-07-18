@@ -192,6 +192,113 @@ final class WtsSDKTests: XCTestCase {
     XCTAssertEqual(diagnostics.queued, 1)
   }
 
+  func testPersonalizedExperienceUsesContextualFallbackUntilIdentityIsBound() async throws {
+    let fixture = try Self.signedContextualExperienceFixture()
+    let transport = Self.experienceTransport(fixture: fixture)
+    let recorder = ManualPresentationRecorder()
+    let sdk = WtsSDK(
+      transport: transport,
+      identity: StaticIdentity(),
+      store: MemoryEventStore(),
+      identityStore: MemoryIdentityMutationStore(),
+      identityBindingStore: MemoryIdentityBindingStore(),
+      experienceInteractionStore: MemoryExperienceInteractionStore()
+    )
+    try await sdk.configure(
+      appKey: "public-app-key",
+      options: WtsOptions(
+        experiences: WtsExperienceOptions(
+          enabled: true,
+          renderMode: .manual,
+          manifestVerificationKeys: fixture.verificationKeys
+        )
+      )
+    )
+    await sdk.onExperienceAvailable { recorder.append($0) }
+    try await sdk.setProfileConsent(.granted)
+
+    let consentResult = try await sdk.setExperienceConsent(.personalized)
+    XCTAssertEqual(consentResult, .accepted)
+    try await sdk.screen("checkout")
+
+    let requests = await transport.requests
+    let bootstrap = try XCTUnwrap(requests.first { $0.url?.path == "/experiences/v1/bootstrap" })
+    let bootstrapBody = try XCTUnwrap(bootstrap.httpBody)
+    let bootstrapJSON = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: bootstrapBody) as? [String: Any]
+    )
+    XCTAssertEqual(bootstrapJSON["consent"] as? String, "contextual")
+    XCTAssertFalse(requests.contains { $0.url?.path == "/experiences/v1/decide" })
+    XCTAssertEqual(recorder.count, 1)
+  }
+
+  func testPersonalizedExperienceDecidesAfterAcceptedIdentityBinding() async throws {
+    let fixture = try Self.signedContextualExperienceFixture()
+    let transport = MockTransport { request in
+      switch request.url?.path {
+      case "/experiences/v1/bootstrap":
+        return (fixture.response, 200)
+      case "/api/v1/sdk/v2/identity/mutations":
+        let body = try XCTUnwrap(request.httpBody)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let identifiers = (json["mutations"] as? [[String: Any]])?
+          .compactMap { $0["clientMutationId"] as? String } ?? []
+        return (
+          try JSONSerialization.data(withJSONObject: [
+            "accepted": identifiers, "duplicates": [], "rejected": [],
+          ]), 202
+        )
+      case "/experiences/v1/decide":
+        return (try JSONSerialization.data(withJSONObject: ["decisions": []]), 200)
+      case "/experiences/v1/interactions/batch", "/api/v1/sdk/v3/events/batch":
+        let body = try XCTUnwrap(request.httpBody)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let identifiers = ((json["interactions"] ?? json["events"]) as? [[String: Any]])?
+          .compactMap { $0["clientInteractionId"] as? String ?? $0["clientEventId"] as? String }
+          ?? []
+        return (
+          try JSONSerialization.data(withJSONObject: [
+            "accepted": identifiers, "duplicates": [], "rejected": [],
+          ]), 202
+        )
+      default:
+        XCTFail("Unexpected Experience request: \(request.url?.path ?? "nil")")
+        return (Data(), 404)
+      }
+    }
+    let sdk = WtsSDK(
+      transport: transport,
+      identity: StaticIdentity(),
+      store: MemoryEventStore(),
+      identityStore: MemoryIdentityMutationStore(),
+      identityBindingStore: MemoryIdentityBindingStore(),
+      experienceInteractionStore: MemoryExperienceInteractionStore()
+    )
+    try await sdk.configure(
+      appKey: "public-app-key",
+      options: WtsOptions(
+        experiences: WtsExperienceOptions(
+          enabled: true,
+          renderMode: .manual,
+          manifestVerificationKeys: fixture.verificationKeys
+        )
+      )
+    )
+    try await sdk.setProfileConsent(.granted)
+    let consentResult = try await sdk.setExperienceConsent(.personalized)
+    XCTAssertEqual(consentResult, .accepted)
+    try await sdk.identify("customer_1842")
+    try await sdk.screen("checkout")
+
+    let requests = await transport.requests
+    let decision = try XCTUnwrap(requests.first { $0.url?.path == "/experiences/v1/decide" })
+    let decisionBody = try XCTUnwrap(decision.httpBody)
+    let decisionJSON = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: decisionBody) as? [String: Any]
+    )
+    XCTAssertEqual(decisionJSON["consent"] as? String, "personalized")
+  }
+
   func testExperienceManifestFailsClosedForMissingKeyInvalidSignatureUnknownKeyAndExpiry() async throws {
     let validFixture = try Self.signedContextualExperienceFixture()
     let invalidSignatureFixture = try Self.signedContextualExperienceFixture(signatureTampered: true)
@@ -580,7 +687,7 @@ final class WtsSDKTests: XCTestCase {
               "participant": { "id": "participant_123", "sourceId": "source_123", "sourceType": "mobile_app", "status": "paired" },
               "sessionToken": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
               "testProfile": { "externalUserId": "test_profile_123" },
-              "requiredSdkVersion": "0.3.0-alpha.1",
+              "requiredSdkVersion": "0.4.0-alpha.1",
               "testPlan": {
                 "profile": { "selected": true, "available": true, "allowedMethods": ["identify", "update_user", "set_once", "increment", "reported_attribution", "reset_identity"] },
                 "events": [{ "eventKey": "checkout_started", "properties": [{ "key": "cart_total", "type": "number", "required": true }], "revenueEnabled": true }],
@@ -596,7 +703,7 @@ final class WtsSDKTests: XCTestCase {
         return (
           Data(
             """
-            { "accepted": true, "compatible": true, "requiredSdkVersion": "0.3.0-alpha.1", "checks": [{ "key": "sdk_version", "status": "ready", "code": null, "message": "Ready" }], "testPlan": { "profile": { "selected": true, "available": true, "allowedMethods": ["identify", "update_user", "set_once", "increment", "reported_attribution", "reset_identity"] }, "events": [{ "eventKey": "checkout_started", "properties": [{ "key": "cart_total", "type": "number", "required": true }], "revenueEnabled": true }], "deepLink": { "selected": true, "available": true, "linkId": "link_123" }, "experience": { "selected": true, "available": true, "campaignId": "campaign_123", "versionId": "version_123" }, "screen": { "selected": true } } }
+            { "accepted": true, "compatible": true, "requiredSdkVersion": "0.4.0-alpha.1", "checks": [{ "key": "sdk_version", "status": "ready", "code": null, "message": "Ready" }], "testPlan": { "profile": { "selected": true, "available": true, "allowedMethods": ["identify", "update_user", "set_once", "increment", "reported_attribution", "reset_identity"] }, "events": [{ "eventKey": "checkout_started", "properties": [{ "key": "cart_total", "type": "number", "required": true }], "revenueEnabled": true }], "deepLink": { "selected": true, "available": true, "linkId": "link_123" }, "experience": { "selected": true, "available": true, "campaignId": "campaign_123", "versionId": "version_123" }, "screen": { "selected": true } } }
             """.utf8
           ), 200
         )
@@ -985,6 +1092,15 @@ private final class MemoryIdentityMutationStore: IdentityMutationStoring, @unche
   func save(_ mutations: [IdentityMutationRequest]) throws {
     lock.withLock { self.mutations = mutations }
   }
+}
+
+private final class MemoryIdentityBindingStore: IdentityBindingStoring, @unchecked Sendable {
+  private let lock = NSLock()
+  private var binding: PersistedIdentityBinding?
+
+  func load() throws -> PersistedIdentityBinding? { lock.withLock { binding } }
+  func save(_ binding: PersistedIdentityBinding) throws { lock.withLock { self.binding = binding } }
+  func clear() throws { lock.withLock { binding = nil } }
 }
 
 private final class MemoryExperienceInteractionStore: ExperienceInteractionStoring,
