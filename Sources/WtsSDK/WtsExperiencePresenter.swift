@@ -10,14 +10,8 @@
       _ experience: WtsExperience,
       onImpression: @escaping @Sendable () -> Void,
       onAction: @escaping @Sendable (WtsExperienceAction) -> Void,
-      onDismiss: @escaping @Sendable () -> Void
+      onDismiss: @escaping @Sendable (WtsExperienceDismissReason) -> Void
     ) async -> Bool {
-      if experience.content.delaySeconds > 0 {
-        try? await Task.sleep(
-          nanoseconds: UInt64(experience.content.delaySeconds * 1_000_000_000)
-        )
-        guard !Task.isCancelled else { return false }
-      }
       guard let presenter = topViewController(), presenter.presentedViewController == nil else {
         return false
       }
@@ -41,8 +35,11 @@
       return true
     }
 
-    static func dismissCurrent(notify: Bool = true) {
-      (currentController as? ExperienceViewController)?.finish(notify: notify)
+    static func dismissCurrent(
+      notify: Bool = true,
+      reason: WtsExperienceDismissReason = .dismissed
+    ) {
+      (currentController as? ExperienceViewController)?.finish(notify: notify, reason: reason)
     }
 
     private static func topViewController() -> UIViewController? {
@@ -66,7 +63,7 @@
     private let experience: WtsExperience
     private let onImpression: @Sendable () -> Void
     private let onAction: @Sendable (WtsExperienceAction) -> Void
-    private let onDismiss: @Sendable () -> Void
+    private let onDismiss: @Sendable (WtsExperienceDismissReason) -> Void
     private var impressionTask: Task<Void, Never>?
     private var autoCloseTask: Task<Void, Never>?
     private var imageTask: Task<Void, Never>?
@@ -77,7 +74,7 @@
       experience: WtsExperience,
       onImpression: @escaping @Sendable () -> Void,
       onAction: @escaping @Sendable (WtsExperienceAction) -> Void,
-      onDismiss: @escaping @Sendable () -> Void
+      onDismiss: @escaping @Sendable (WtsExperienceDismissReason) -> Void
     ) {
       self.experience = experience
       self.onImpression = onImpression
@@ -163,7 +160,7 @@
         let close = UIButton(type: .close)
         close.accessibilityLabel = NSLocalizedString("Close", comment: "")
         close.translatesAutoresizingMaskIntoConstraints = false
-        close.addAction(UIAction { [weak self] _ in self?.finish() }, for: .touchUpInside)
+        close.addAction(UIAction { [weak self] _ in self?.finish(reason: .dismissed) }, for: .touchUpInside)
         card.addSubview(close)
         NSLayoutConstraint.activate([
           close.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
@@ -200,7 +197,7 @@
             nanoseconds: UInt64(autoCloseSeconds * 1_000_000_000)
           )
           guard !Task.isCancelled else { return }
-          finish()
+          finish(reason: .autoClosed)
         }
       }
     }
@@ -214,7 +211,7 @@
 
     private func perform(_ action: WtsExperienceAction) {
       onAction(action)
-      finish()
+      finish(reason: .dismissed)
     }
 
     private var isAtLeastHalfVisible: Bool {
@@ -230,14 +227,17 @@
       return totalArea > 0 && visible.width * visible.height / totalArea >= 0.5
     }
 
-    fileprivate func finish(notify: Bool = true) {
+    fileprivate func finish(
+      notify: Bool = true,
+      reason: WtsExperienceDismissReason = .dismissed
+    ) {
       guard !completed else { return }
       completed = true
       impressionTask?.cancel()
       autoCloseTask?.cancel()
       imageTask?.cancel()
       if notify {
-        dismiss(animated: true, completion: onDismiss)
+        dismiss(animated: true) { [onDismiss] in onDismiss(reason) }
       } else {
         dismiss(animated: true)
       }
@@ -250,7 +250,7 @@
       impressionTask?.cancel()
       autoCloseTask?.cancel()
       imageTask?.cancel()
-      onDismiss()
+      onDismiss(.dismissed)
     }
   }
 #endif
