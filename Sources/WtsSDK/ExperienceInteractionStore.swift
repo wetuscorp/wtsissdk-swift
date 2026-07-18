@@ -1,28 +1,30 @@
 import Foundation
 
-protocol IdentityMutationStoring: Sendable {
-  func load() throws -> [IdentityMutationRequest]
-  func save(_ mutations: [IdentityMutationRequest]) throws
+protocol ExperienceInteractionStoring: Sendable {
+  func load() throws -> [ExperienceInteractionRequest]
+  func save(_ interactions: [ExperienceInteractionRequest]) throws
 }
 
-struct FileIdentityMutationStore: IdentityMutationStoring {
+struct FileExperienceInteractionStore: ExperienceInteractionStoring {
   let fileURL: URL
-  private let encoder = JSONEncoder.wts
-  private let decoder = JSONDecoder.wts
+  private let encoder: JSONEncoder
+  private let decoder: JSONDecoder
 
   init(fileURL: URL? = nil) {
     let directory = FileManager.default.urls(
       for: .applicationSupportDirectory,
       in: .userDomainMask
     ).first!.appendingPathComponent("co.wetus.wts-sdk", isDirectory: true)
-    self.fileURL = fileURL ?? directory.appendingPathComponent("identity-v1.json")
+    self.fileURL = fileURL ?? directory.appendingPathComponent("experience-interactions-v1.json")
+    encoder = JSONEncoder.wts
+    decoder = JSONDecoder.wts
   }
 
-  func load() throws -> [IdentityMutationRequest] {
+  func load() throws -> [ExperienceInteractionRequest] {
     guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
     do {
       return try decoder.decode(
-        [IdentityMutationRequest].self,
+        [ExperienceInteractionRequest].self,
         from: Data(contentsOf: fileURL)
       )
     } catch {
@@ -31,17 +33,17 @@ struct FileIdentityMutationStore: IdentityMutationStoring {
     }
   }
 
-  func save(_ mutations: [IdentityMutationRequest]) throws {
+  func save(_ interactions: [ExperienceInteractionRequest]) throws {
     let directory = fileURL.deletingLastPathComponent()
     try FileManager.default.createDirectory(
       at: directory,
       withIntermediateDirectories: true
     )
-    if mutations.isEmpty {
+    if interactions.isEmpty {
       try? FileManager.default.removeItem(at: fileURL)
       return
     }
-    try encoder.encode(mutations).write(
+    try encoder.encode(interactions).write(
       to: fileURL,
       options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
     )
