@@ -108,6 +108,154 @@ public enum WtsProfileConsent: Sendable, Equatable {
   case denied
 }
 
+/** An explicit dashboard-issued credential for a short-lived SDK Test & Validate session. */
+public struct WtsTestSessionPairing: Sendable, Equatable {
+  public let pairingToken: String?
+  public let pairingCode: String?
+
+  public init(pairingToken: String? = nil, pairingCode: String? = nil) throws {
+    guard (pairingToken != nil) != (pairingCode != nil) else {
+      throw WtsSDKError.invalidTestSessionPairing
+    }
+    if let pairingToken {
+      guard (32...512).contains(pairingToken.count) else {
+        throw WtsSDKError.invalidTestSessionPairing
+      }
+      self.pairingToken = pairingToken
+      self.pairingCode = nil
+      return
+    }
+    let normalized = pairingCode!.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    guard normalized.range(of: "^[A-Z2-9]{16}$", options: .regularExpression) != nil else {
+      throw WtsSDKError.invalidTestSessionPairing
+    }
+    self.pairingToken = nil
+    self.pairingCode = normalized
+  }
+
+  public static func parse(_ value: String) throws -> WtsTestSessionPairing {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { throw WtsSDKError.invalidTestSessionPairing }
+    if let url = URL(string: trimmed),
+      url.scheme == "https",
+      (url.path == "/_wts/test/pair"
+        || (["wts.is", "www.wts.is"].contains(url.host?.lowercased() ?? "")
+          && url.path == "/sdk-test/pair")),
+      let pairing = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+        .queryItems?.first(where: { $0.name == "pairing" })?.value
+    {
+      return try WtsTestSessionPairing(pairingToken: pairing)
+    }
+    if trimmed.range(of: "^[A-Z2-9]{16}$", options: [.regularExpression, .caseInsensitive]) != nil {
+      return try WtsTestSessionPairing(pairingCode: trimmed)
+    }
+    return try WtsTestSessionPairing(pairingToken: trimmed)
+  }
+}
+
+public enum WtsTestSessionSDKFamily: String, Sendable, Equatable {
+  case nativeSwift = "swift"
+  case flutter
+  case reactNative = "react_native"
+}
+
+public struct WtsTestSessionCheck: Sendable, Equatable {
+  public let key: String
+  public let status: String
+  public let code: String?
+  public let message: String?
+
+  public init(key: String, status: String, code: String? = nil, message: String? = nil) {
+    self.key = key
+    self.status = status
+    self.code = code
+    self.message = message
+  }
+}
+
+public struct WtsTestSessionJoinResult: Sendable, Equatable {
+  public let accepted: Bool
+  public let joined: Bool
+  public let compatible: Bool
+  public let requiredSDKVersion: String?
+  public let checks: [WtsTestSessionCheck]
+  public let sessionId: String?
+  public let expiresAt: Date?
+  /** Returned only to the direct pairing caller; never persisted in test observations. */
+  public let testProfileExternalUserId: String?
+  public let errorCode: String?
+}
+
+public struct WtsTestSessionDiagnostics: Sendable, Equatable {
+  public let joined: Bool
+  public let compatible: Bool
+  public let sessionId: String?
+  public let expiresAt: Date?
+  public let requiredSDKVersion: String?
+  public let checks: [WtsTestSessionCheck]
+  public let pendingSignals: Int
+  public let lastErrorCode: String?
+}
+
+public struct WtsTestSessionProbeLink: Sendable, Equatable {
+  public let id: String
+  public let path: String
+  public let parameters: [String: WtsValue]
+}
+
+public struct WtsTestSessionProbeResult: Sendable, Equatable {
+  public let match: Bool
+  public let status: String
+  public let code: String
+  public let originalURL: URL
+  public let fallbackURL: URL
+  public let link: WtsTestSessionProbeLink?
+}
+
+public struct WtsTestSessionProbeRunResult: Sendable, Equatable {
+  public let accepted: Bool
+  public let emitted: [String]
+  public let skipped: [String]
+  public let pendingSignals: Int
+  /**
+   * An isolated test-only decision. It is intentionally not passed to the
+   * production Experience runtime or rendered automatically.
+   */
+  public let experienceDecision: WtsTestSessionExperienceDecision?
+}
+
+public enum WtsTestSessionExperienceInteraction: Sendable, Equatable {
+  case impression
+  case action
+}
+
+public struct WtsTestSessionExperienceDecision: Sendable, Equatable {
+  public let outcome: String
+  public let reason: String?
+  public let testGrant: WtsTestSessionExperienceGrant?
+  public let decision: WtsTestSessionExperienceCampaign?
+}
+
+public struct WtsTestSessionExperienceGrant: Sendable, Equatable {
+  public let fixtureId: String
+  public let expiresAt: String
+}
+
+public struct WtsTestSessionExperienceCampaign: Sendable, Equatable {
+  public let campaignId: String
+  public let campaignVersionId: String
+  public let placement: String
+  public let defaultLocale: String
+  public let variant: WtsTestSessionExperienceVariant?
+}
+
+public struct WtsTestSessionExperienceVariant: Sendable, Equatable {
+  public let id: String
+  public let key: String
+  public let content: WtsTestSessionJSONValue
+  public let assetURL: URL?
+}
+
 public struct WtsDeepLink: Sendable, Equatable {
   public let path: String
   public let parameters: [String: WtsValue]
@@ -187,6 +335,7 @@ public enum WtsSDKError: Error, Sendable, Equatable {
   case invalidResponse(fallbackURL: URL?)
   case invalidEvent(reason: String)
   case invalidProfile(reason: String)
+  case invalidTestSessionPairing
   case profileConsentRequired
   case experienceProfileConsentRequired
   case storage
@@ -203,6 +352,7 @@ public enum WtsSDKError: Error, Sendable, Equatable {
     case .invalidResponse: "INVALID_RESPONSE"
     case .invalidEvent: "INVALID_EVENT"
     case .invalidProfile: "INVALID_PROFILE"
+    case .invalidTestSessionPairing: "INVALID_TEST_SESSION_PAIRING"
     case .profileConsentRequired: "PROFILE_CONSENT_REQUIRED"
     case .experienceProfileConsentRequired: "EXPERIENCE_PROFILE_CONSENT_REQUIRED"
     case .storage: "STORAGE_ERROR"
@@ -233,6 +383,7 @@ extension WtsSDKError: LocalizedError {
     case .invalidResponse: "The wts.is API response was invalid."
     case .invalidEvent(let reason): reason
     case .invalidProfile(let reason): reason
+    case .invalidTestSessionPairing: "The SDK Test & Validate pairing credential is invalid."
     case .profileConsentRequired: "Profile consent must be granted before using identity APIs."
     case .experienceProfileConsentRequired: "Personalized Experiences require profile consent."
     case .storage: "The wts.is local event queue could not be persisted."

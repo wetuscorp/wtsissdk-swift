@@ -303,6 +303,190 @@ final class WtsSDKTests: XCTestCase {
     )
   }
 
+  func testTestSessionIsOptInSanitizedAndUsesIsolatedExperienceDecision() async throws {
+    let testStore = MemoryTestSessionStore()
+    let transport = MockTransport { request in
+      switch request.url?.path {
+      case "/api/v1/sdk/test/v1/pair":
+        return (
+          Data(
+            """
+            {
+              "session": { "id": "session_123", "status": "running", "expiresAt": "2099-01-01T00:00:00.000Z" },
+              "participant": { "id": "participant_123", "sourceId": "source_123", "sourceType": "mobile_app", "status": "paired" },
+              "sessionToken": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "testProfile": { "externalUserId": "test_profile_123" },
+              "requiredSdkVersion": "0.3.0-alpha.1",
+              "testPlan": {
+                "profile": { "selected": true, "available": true, "allowedMethods": ["identify", "update_user", "set_once", "increment", "reported_attribution", "reset_identity"] },
+                "events": [{ "eventKey": "checkout_started", "properties": [{ "key": "cart_total", "type": "number", "required": true }], "revenueEnabled": true }],
+                "deepLink": { "selected": true, "available": true, "linkId": "link_123" },
+                "experience": { "selected": true, "available": true, "campaignId": "campaign_123", "versionId": "version_123" },
+                "screen": { "selected": true }
+              }
+            }
+            """.utf8
+          ), 200
+        )
+      case "/api/v1/sdk/test/v1/handshake":
+        return (
+          Data(
+            """
+            { "accepted": true, "compatible": true, "requiredSdkVersion": "0.3.0-alpha.1", "checks": [{ "key": "sdk_version", "status": "ready", "code": null, "message": "Ready" }], "testPlan": { "profile": { "selected": true, "available": true, "allowedMethods": ["identify", "update_user", "set_once", "increment", "reported_attribution", "reset_identity"] }, "events": [{ "eventKey": "checkout_started", "properties": [{ "key": "cart_total", "type": "number", "required": true }], "revenueEnabled": true }], "deepLink": { "selected": true, "available": true, "linkId": "link_123" }, "experience": { "selected": true, "available": true, "campaignId": "campaign_123", "versionId": "version_123" }, "screen": { "selected": true } } }
+            """.utf8
+          ), 200
+        )
+      case "/api/v1/sdk/test/v1/signals/batch":
+        let body = try XCTUnwrap(request.httpBody)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let signals = try XCTUnwrap(json["signals"] as? [[String: Any]])
+        let identifiers = signals.compactMap { $0["clientSignalId"] as? String }
+        return (
+          try JSONSerialization.data(withJSONObject: [
+            "accepted": identifiers,
+            "duplicates": [],
+            "rejected": [],
+          ]), 202
+        )
+      case "/api/v1/sdk/test/v1/experiences/decide":
+        return (
+          Data(
+            """
+            {
+              "outcome": "ready",
+              "reason": null,
+              "testGrant": { "fixtureId": "fixture_123", "expiresAt": "2099-01-01T00:00:00.000Z" },
+              "decision": {
+                "campaignId": "campaign_123",
+                "campaignVersionId": "version_123",
+                "placement": "modal",
+                "defaultLocale": "en",
+                "variant": { "id": "variant_123", "key": "control", "content": {}, "asset": null }
+              }
+            }
+            """.utf8
+          ), 200
+        )
+      case "/api/v1/sdk/test/v1/resolve":
+        return (
+          Data(
+            """
+            {
+              "match": true,
+              "status": "ready",
+              "code": "RESOLVED",
+              "originalUrl": "https://sample.wts.is/offer",
+              "fallbackUrl": "https://example.com/offer",
+              "link": { "id": "link_123", "path": "/offer", "parameters": {} }
+            }
+            """.utf8
+          ), 200
+        )
+      case "/api/v1/sdk/test/v1/leave":
+        return (Data("{ \"accepted\": true }".utf8), 200)
+      case "/api/v1/sdk/v3/events/batch":
+        let body = try XCTUnwrap(request.httpBody)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let identifiers = (json["events"] as? [[String: Any]])?.compactMap {
+          $0["clientEventId"] as? String
+        } ?? []
+        return (
+          try JSONSerialization.data(withJSONObject: [
+            "accepted": identifiers,
+            "duplicates": [],
+            "rejected": [],
+          ]), 202
+        )
+      default:
+        XCTFail("Unexpected request: \(request.url?.path ?? "nil")")
+        return (Data(), 404)
+      }
+    }
+    let sdk = WtsSDK(
+      transport: transport,
+      identity: StaticIdentity(),
+      store: MemoryEventStore(),
+      testSessionStore: testStore
+    )
+    try await sdk.configure(
+      appKey: "public-app-key",
+      options: WtsOptions(experiences: WtsExperienceOptions(enabled: true, renderMode: .manual))
+    )
+
+    try await sdk.track(eventKey: "checkout_started", properties: ["cart_total": .number(749.9)])
+    XCTAssertNil(try testStore.load())
+
+    XCTAssertEqual(
+      try WtsTestSessionPairing.parse("A2B3C4D5E6F7G8H9").pairingCode,
+      "A2B3C4D5E6F7G8H9"
+    )
+    let pairing = try WtsTestSessionPairing.parse(
+      "https://sample.wts.is/_wts/test/pair?pairing=" + String(repeating: "p", count: 32)
+    )
+    XCTAssertEqual(pairing.pairingToken, String(repeating: "p", count: 32))
+    let joined = await sdk.joinTestSession(pairing)
+    XCTAssertTrue(joined.accepted)
+    XCTAssertTrue(joined.compatible)
+    XCTAssertEqual(joined.testProfileExternalUserId, "test_profile_123")
+
+    try await sdk.track(
+      eventKey: "checkout_started",
+      properties: ["cart_total": .number(749.9)],
+      revenue: WtsRevenue(amount: "749.90", currency: "try")
+    )
+    let probe = try await sdk.probeTestSessionURL(
+      XCTUnwrap(URL(string: "https://sample.wts.is/offer?secret=value"))
+    )
+    XCTAssertTrue(probe.match)
+    let probes = try await sdk.runTestSessionProbes()
+    XCTAssertTrue(probes.emitted.contains("identity"))
+    XCTAssertTrue(probes.emitted.contains("event"))
+    XCTAssertTrue(probes.emitted.contains("screen"))
+    XCTAssertTrue(probes.emitted.contains("experiences"))
+    XCTAssertEqual(probes.experienceDecision?.outcome, "ready")
+    let reportedTestInteraction = await sdk.reportTestSessionExperienceInteraction(.action)
+    XCTAssertTrue(reportedTestInteraction)
+    await sdk.flush()
+    let leftTestSession = await sdk.leaveTestSession()
+    XCTAssertTrue(leftTestSession)
+
+    let paths = await transport.requestedPaths
+    XCTAssertTrue(paths.contains("/api/v1/sdk/test/v1/experiences/decide"))
+    XCTAssertTrue(paths.contains("/api/v1/sdk/test/v1/resolve"))
+    XCTAssertTrue(paths.contains("/api/v1/sdk/test/v1/leave"))
+    XCTAssertFalse(paths.contains("/experiences/v1/interactions/batch"))
+    let requests = await transport.requests
+    let signalBodies = requests.filter { $0.url?.path == "/api/v1/sdk/test/v1/signals/batch" }
+      .compactMap(\.httpBody)
+    let signals = signalBodies.flatMap { body -> [[String: Any]] in
+      let payload = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+      return payload?["signals"] as? [[String: Any]] ?? []
+    }
+    let serialized = String(data: signalBodies.reduce(Data(), +), encoding: .utf8) ?? ""
+    XCTAssertTrue(serialized.contains("checkout_started"))
+    XCTAssertTrue(serialized.contains("cart_total"))
+    for method in ["identify", "update_user", "set_once", "increment", "reported_attribution", "reset_identity"] {
+      XCTAssertTrue(serialized.contains("\"method\":\"\(method)\""))
+    }
+    XCTAssertTrue(serialized.contains("sdk_test_increment"))
+    XCTAssertTrue(signals.contains { signal in
+      let revenue = signal["revenue"] as? [String: Any]
+      return revenue?["present"] as? Bool == true && revenue?["currency"] as? String == "TRY"
+    })
+    XCTAssertTrue(signals.contains { signal in
+      let revenue = signal["revenue"] as? [String: Any]
+      return revenue?["present"] as? Bool == true && revenue?["currency"] as? String == "USD"
+    })
+    XCTAssertTrue(serialized.contains("experience_action"))
+    XCTAssertFalse(serialized.contains("experience_decision"))
+    XCTAssertFalse(serialized.contains("749.9"))
+    XCTAssertFalse(serialized.contains("secret=value"))
+    XCTAssertFalse(serialized.contains("test_profile_123"))
+    let diagnostics = await sdk.getTestSessionDiagnostics()
+    XCTAssertFalse(diagnostics.joined)
+    XCTAssertNil(try testStore.load())
+  }
+
   private static func fixture(_ name: String) throws -> Data {
     let root = URL(fileURLWithPath: #filePath)
       .deletingLastPathComponent()
@@ -380,12 +564,14 @@ private actor MockTransport: HTTPTransport {
   private let handler: Handler
   private(set) var requestCount = 0
   private(set) var requestedPaths: [String] = []
+  private(set) var requests: [URLRequest] = []
 
   init(handler: @escaping Handler) { self.handler = handler }
 
   func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
     requestCount += 1
     requestedPaths.append(request.url?.path ?? "")
+    requests.append(request)
     let (data, status) = try handler(request)
     let response = HTTPURLResponse(
       url: request.url!,
@@ -429,4 +615,13 @@ private final class MemoryExperienceInteractionStore: ExperienceInteractionStori
   func save(_ interactions: [ExperienceInteractionRequest]) throws {
     lock.withLock { self.interactions = interactions }
   }
+}
+
+private final class MemoryTestSessionStore: TestSessionStoring, @unchecked Sendable {
+  private let lock = NSLock()
+  private var session: PersistedTestSession?
+
+  func load() throws -> PersistedTestSession? { lock.withLock { session } }
+  func save(_ session: PersistedTestSession) throws { lock.withLock { self.session = session } }
+  func clear() throws { lock.withLock { session = nil } }
 }

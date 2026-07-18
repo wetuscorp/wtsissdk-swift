@@ -2,7 +2,12 @@
 
 Official, source-based SDK for wts.is deep links and mobile attribution. It resolves verified Universal Links, returns an application-owned route, and queues registered custom events and revenue safely while offline. The SDK never navigates your UI.
 
-> `0.3.0-alpha.1` · Mobile Protocol V3 + Identity V1 + Experiences V1 · iOS 15+ · Swift 5.9+
+> `0.3.0-alpha.1` source line · Mobile Protocol V3 + Identity V1 + Experiences V1 + SDK Test Session V1 · iOS 15+ · Swift 5.9+
+
+> **Release note:** SDK Test & Validate APIs below are source-line APIs. Use
+> them only after the matching Swift Package/CocoaPods release has been
+> published. This document does not claim that `0.3.0-alpha.1` is already
+> available through either registry.
 
 ## Installation
 
@@ -16,7 +21,8 @@ In Xcode choose **File → Add Package Dependencies** and enter:
 https://github.com/wetuscorp/wtsissdk-swift.git
 ```
 
-Select the exact `0.3.0-alpha.1` version, link the `WtsSDK` product to the application target, then:
+Select the matching published version that declares SDK Test Session V1 support,
+link the `WtsSDK` product to the application target, then:
 
 ```swift
 import WtsSDK
@@ -32,7 +38,7 @@ source 'https://cdn.cocoapods.org/'
 platform :ios, '15.0'
 
 target 'YourApp' do
-  pod 'WtsSDK', '0.3.0-alpha.1'
+  pod 'WtsSDK', '<matching-published-version>'
 end
 ```
 
@@ -130,6 +136,73 @@ To test an unpublished revision on this installation, read
 to the matching Mobile App from the dashboard. The random source-scoped token
 contains no install, user, or profile identifier, and test traffic is excluded
 from customer analytics and usage.
+
+## SDK Test & Validate
+
+SDK Test & Validate is a dashboard-issued, short-lived validation session. Its
+bounded retry queue is isolated from production events, identities,
+attribution, and Experience delivery. Do not hardcode, log, or persist a
+pairing URL or token outside the SDK.
+
+The dashboard QR code uses this canonical form:
+
+```text
+https://<mobile-app-host>/_wts/test/pair?pairing=<dashboard-issued-token>
+```
+
+Inspect each incoming URL for that pairing route and join it **before** normal
+Universal Link handling. A pairing URL is not an application route and must
+not be passed to `handle(url:)`.
+
+```swift
+private func isWtsTestPairing(_ url: URL) -> Bool {
+    url.scheme == "https" && url.path == "/_wts/test/pair"
+}
+
+func open(_ url: URL) async {
+    if isWtsTestPairing(url) {
+        do {
+            let pairing = try WtsTestSessionPairing.parse(url.absoluteString)
+            let joined = await WtsSDK.shared.joinTestSession(pairing)
+            showSdkTestChecks(joined.checks)
+        } catch {
+            showSdkTestPairingError(error)
+        }
+        return
+    }
+
+    // Normal production behavior stays unchanged.
+    do {
+        let link = try await WtsSDK.shared.handle(url: url)
+        guard allowedRoutes.contains(link.path) else { return }
+        router.navigate(path: link.path, parameters: link.parameters)
+    } catch let error as WtsSDKError {
+        if let fallback = error.fallbackURL { await openInBrowser(fallback) }
+    } catch { /* application logging */ }
+}
+```
+
+Use diagnostics and the dashboard-selected test plan without producing normal
+analytics:
+
+```swift
+let diagnostics = WtsSDK.shared.getTestSessionDiagnostics()
+let probes = try await WtsSDK.shared.runTestSessionProbes()
+
+// This decision is test-only. Render the typed content in a test preview,
+// never through the normal Experiences runtime.
+if probes.experienceDecision?.outcome == "ready" {
+    presentTestExperiencePreview(probes.experienceDecision!)
+    _ = await WtsSDK.shared.reportTestSessionExperienceInteraction(.impression)
+}
+```
+
+Report `.action` only after a real action in that manual test preview. It is
+accepted only after the isolated decision is ready; production Experience
+lifecycle signals are never mirrored to the test session. Use
+`probeTestSessionUrl(_:)` for an event-free resolver check, and call
+`leaveTestSession()` when the operator finishes. Expiry also clears the
+session.
 
 ## User identity and reported attribution
 

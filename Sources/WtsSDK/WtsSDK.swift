@@ -13,6 +13,7 @@ public actor WtsSDK {
   private let store: EventStoring
   private let identityStore: IdentityMutationStoring
   private let experienceInteractionStore: ExperienceInteractionStoring
+  private let testSessionStore: TestSessionStoring
   private let encoder = JSONEncoder.wts
   private let decoder = JSONDecoder.wts
   private var appKey: String?
@@ -35,6 +36,10 @@ public actor WtsSDK {
   private var presentingExperience: WtsExperience?
   private var experienceSessionImpressions = 0
   private var experienceTestDeviceToken = UUID().uuidString.lowercased()
+  private var testSession: PersistedTestSession?
+  private var testSessionLastErrorCode: String?
+  private var testSessionRetryTask: Task<Void, Never>?
+  private var testSessionRetryAttempt = 0
 
   public init() {
     transport = URLSessionTransport()
@@ -42,6 +47,7 @@ public actor WtsSDK {
     store = FileEventStore()
     identityStore = FileIdentityMutationStore()
     experienceInteractionStore = FileExperienceInteractionStore()
+    testSessionStore = FileTestSessionStore()
   }
 
   init(
@@ -50,13 +56,15 @@ public actor WtsSDK {
     store: EventStoring,
     identityStore: IdentityMutationStoring = FileIdentityMutationStore(),
     experienceInteractionStore: ExperienceInteractionStoring =
-      FileExperienceInteractionStore()
+      FileExperienceInteractionStore(),
+    testSessionStore: TestSessionStoring = FileTestSessionStore()
   ) {
     self.transport = transport
     self.identity = identity
     self.store = store
     self.identityStore = identityStore
     self.experienceInteractionStore = experienceInteractionStore
+    self.testSessionStore = testSessionStore
   }
 
   public func configure(appKey: String, options: WtsOptions = WtsOptions()) throws {
@@ -68,13 +76,33 @@ public actor WtsSDK {
     self.appKey = normalized
     self.options = options
     cache.removeAll()
+    if let restored = try? testSessionStore.load(),
+      restored.sourceKey == normalized,
+      testSessionExpiry(restored.expiresAt) > Date()
+    {
+      testSession = restored
+      if restored.compatible, !restored.pendingSignals.isEmpty {
+        Task { [weak self] in try? await self?.flushTestSessionSignals() }
+      }
+    } else {
+      clearTestSession()
+    }
     scheduleFlush(after: 0)
   }
 
   public func handle(url: URL) async throws -> WtsDeepLink {
     let sourceURL = try unwrap(url)
     let cacheKey = sourceURL.absoluteString
-    if let cached = cache.value(for: cacheKey, now: Date()) { return cached }
+    if let cached = cache.value(for: cacheKey, now: Date()) {
+      recordTestSessionSignal(
+        type: "deep_link_resolved",
+        outcome: "observed",
+        method: "handle",
+        resultCode: "RESOLVED",
+        feature: "deeplink"
+      )
+      return cached
+    }
     let request = ResolveRequest(
       schemaVersion: 3,
       clientEventId: UUID().uuidString.lowercased(),
@@ -99,6 +127,13 @@ public actor WtsSDK {
       isDeferred: response.isDeferred
     )
     cache.insert(result, for: cacheKey, expiresAt: Date().addingTimeInterval(options.cacheTTL))
+    recordTestSessionSignal(
+      type: "deep_link_resolved",
+      outcome: "observed",
+      method: "handle",
+      resultCode: "RESOLVED",
+      feature: "deeplink"
+    )
     return result
   }
 
@@ -108,6 +143,7 @@ public actor WtsSDK {
   }
 
   public func setProfileConsent(_ consent: WtsProfileConsent) throws {
+    recordTestSessionSignal(type: "consent", outcome: "observed", feature: "profile")
     if consent == .granted {
       profileConsentGranted = true
       return
@@ -193,6 +229,15 @@ public actor WtsSDK {
       ))
     trim(&queue)
     try store.save(queue)
+    recordTestSessionSignal(
+      type: "event_recorded",
+      outcome: "observed",
+      eventKey: eventKey,
+      propertyKeys: properties.keys.sorted(),
+      propertyTypes: properties.mapValues(\.testSessionType),
+      revenue: revenue.map { TestSessionRevenueDescriptor(present: true, currency: $0.currency) },
+      feature: "events"
+    )
     scheduleFlush(after: 0)
     await evaluateExperiences(
       context: ExperienceContextWire(
@@ -235,6 +280,14 @@ public actor WtsSDK {
       ))
     trim(&queue)
     try store.save(queue)
+    recordTestSessionSignal(
+      type: "screen_recorded",
+      outcome: "observed",
+      screenName: normalized,
+      propertyKeys: properties.keys.sorted(),
+      propertyTypes: properties.mapValues(\.testSessionType),
+      feature: "screen"
+    )
     scheduleFlush(after: 0)
     await evaluateExperiences(
       context: ExperienceContextWire(
@@ -261,6 +314,7 @@ public actor WtsSDK {
       throw WtsSDKError.experienceProfileConsentRequired
     }
     experienceConsent = consent
+    recordTestSessionSignal(type: "consent", outcome: "observed", feature: "experiences")
     if consent == .pending || consent == .denied {
       experienceManifest = nil
       experienceCandidateVersionIds = []
@@ -331,6 +385,273 @@ public actor WtsSDK {
     )
   }
 
+  /**
+   * Explicitly joins a dashboard-created SDK Test & Validate session. No test
+   * traffic or test observations are emitted until this call succeeds.
+   */
+  public func joinTestSession(
+    _ pairing: WtsTestSessionPairing,
+    sdkFamily: WtsTestSessionSDKFamily = .nativeSwift
+  ) async -> WtsTestSessionJoinResult {
+    do {
+      let pair: TestSessionPairResponse = try await postTest(
+        path: "pair",
+        body: TestSessionPairRequest(
+          pairingToken: pairing.pairingToken,
+          pairingCode: pairing.pairingCode,
+          metadata: testSessionMetadata(sdkFamily)
+        )
+      )
+      let handshake: TestSessionHandshakeResponse = try await postTest(
+        path: "handshake",
+        body: TestSessionHandshakeRequest(
+          participantId: pair.participant.id,
+          sessionToken: pair.sessionToken,
+          metadata: testSessionMetadata(sdkFamily),
+          capabilities: testSessionCapabilities,
+          consent: testSessionConsent
+        )
+      )
+      let active = PersistedTestSession(
+        sourceKey: try configuredAppKey(),
+        sessionId: pair.session.id,
+        participantId: pair.participant.id,
+        sessionToken: pair.sessionToken,
+        expiresAt: pair.session.expiresAt,
+        compatible: handshake.accepted && handshake.compatible,
+        requiredSdkVersion: handshake.requiredSdkVersion,
+        sdkFamily: sdkFamily.rawValue,
+        checks: handshake.checks,
+        testPlan: handshake.testPlan,
+        testExperienceDecisionReady: false,
+        pendingSignals: []
+      )
+      testSession = active
+      testSessionLastErrorCode = nil
+      try testSessionStore.save(active)
+      if active.compatible {
+        recordTestSessionSignal(
+          type: "sdk_connected",
+          outcome: "passed",
+          feature: "sdk_test_session"
+        )
+      }
+      return WtsTestSessionJoinResult(
+        accepted: handshake.accepted,
+        joined: true,
+        compatible: active.compatible,
+        requiredSDKVersion: handshake.requiredSdkVersion,
+        checks: handshake.checks.map(\.publicValue),
+        sessionId: pair.session.id,
+        expiresAt: testSessionExpiry(pair.session.expiresAt),
+        testProfileExternalUserId: pair.testProfile.externalUserId,
+        errorCode: nil
+      )
+    } catch {
+      clearTestSession()
+      testSessionLastErrorCode = testSessionErrorCode(error)
+      return WtsTestSessionJoinResult(
+        accepted: false,
+        joined: false,
+        compatible: false,
+        requiredSDKVersion: nil,
+        checks: [],
+        sessionId: nil,
+        expiresAt: nil,
+        testProfileExternalUserId: nil,
+        errorCode: testSessionLastErrorCode
+      )
+    }
+  }
+
+  public func leaveTestSession() async -> Bool {
+    guard let active = activeTestSession() else { return true }
+    if active.compatible {
+      recordTestSessionSignal(
+        type: "sdk_left",
+        outcome: "observed",
+        feature: "sdk_test_session"
+      )
+      try? await flushTestSessionSignals()
+    }
+    do {
+      let response: TestSessionLeaveResponse = try await postTest(
+        path: "leave",
+        body: TestSessionLeaveRequest(
+          participantId: active.participantId,
+          sessionToken: active.sessionToken
+        )
+      )
+      if response.accepted { clearTestSession() }
+      return response.accepted
+    } catch {
+      testSessionLastErrorCode = testSessionErrorCode(error)
+      persistTestSession()
+      return false
+    }
+  }
+
+  public func getTestSessionDiagnostics() -> WtsTestSessionDiagnostics {
+    let active = activeTestSession()
+    return WtsTestSessionDiagnostics(
+      joined: active != nil,
+      compatible: active?.compatible ?? false,
+      sessionId: active?.sessionId,
+      expiresAt: active.map { testSessionExpiry($0.expiresAt) },
+      requiredSDKVersion: active?.requiredSdkVersion,
+      checks: active?.checks.map(\.publicValue) ?? [],
+      pendingSignals: active?.pendingSignals.count ?? 0,
+      lastErrorCode: testSessionLastErrorCode
+    )
+  }
+
+  public func probeTestSessionURL(_ url: URL) async throws -> WtsTestSessionProbeResult {
+    guard url.scheme?.lowercased() == "https", url.absoluteString.utf8.count <= 2_048 else {
+      throw WtsSDKError.invalidURL(fallbackURL: nil)
+    }
+    let active = try requireActiveTestSession()
+    do {
+      let response: TestSessionResolveResponse = try await postTest(
+        path: "resolve",
+        body: TestSessionResolveRequest(
+          participantId: active.participantId,
+          sessionToken: active.sessionToken,
+          url: url.absoluteString
+        )
+      )
+      recordTestSessionSignal(
+        type: "probe_completed",
+        outcome: response.match ? "passed" : "blocked",
+        method: "resolve",
+        resultCode: response.code,
+        feature: "deeplink"
+      )
+      guard let originalURL = URL(string: response.originalUrl),
+        let fallbackURL = URL(string: response.fallbackUrl)
+      else { throw WtsSDKError.invalidResponse(fallbackURL: nil) }
+      return WtsTestSessionProbeResult(
+        match: response.match,
+        status: response.status,
+        code: response.code,
+        originalURL: originalURL,
+        fallbackURL: fallbackURL,
+        link: response.link.map {
+          WtsTestSessionProbeLink(id: $0.id, path: $0.path, parameters: $0.parameters)
+        }
+      )
+    } catch {
+      testSessionLastErrorCode = testSessionErrorCode(error)
+      recordTestSessionSignal(
+        type: "probe_completed",
+        outcome: "failed",
+        method: "resolve",
+        resultCode: testSessionLastErrorCode,
+        feature: "deeplink"
+      )
+      throw error
+    }
+  }
+
+  /**
+   * Runs synthetic checks exclusively over the test-session protocol. It never
+   * creates production identities, events, screens, or Experience interactions.
+   */
+  public func runTestSessionProbes() async throws -> WtsTestSessionProbeRunResult {
+    let active = try requireActiveTestSession()
+    var emitted: [String] = []
+    var skipped: [String] = []
+    let identityMethods: [String] = if let profile = active.testPlan.profile,
+      profile.selected, profile.available
+    {
+      profile.allowedMethods
+    } else {
+      []
+    }
+    if !identityMethods.isEmpty {
+      for method in identityMethods {
+        recordTestSessionSignal(
+          type: "identity_recorded",
+          outcome: "passed",
+          method: method,
+          propertyKeys: method == "increment" ? ["sdk_test_increment"] : nil,
+          propertyTypes: method == "increment" ? ["sdk_test_increment": "number"] : nil,
+          feature: "identity"
+        )
+      }
+      emitted.append("identity")
+    } else {
+      skipped.append("identity")
+    }
+    if let event = active.testPlan.events.first {
+      recordTestSessionSignal(
+        type: "event_recorded",
+        outcome: "passed",
+        eventKey: event.eventKey,
+        propertyKeys: event.properties.map(\.key),
+        propertyTypes: Dictionary(uniqueKeysWithValues: event.properties.map { ($0.key, $0.type) }),
+        revenue: event.revenueEnabled
+          ? TestSessionRevenueDescriptor(present: true, currency: "USD")
+          : nil,
+        feature: "events"
+      )
+      emitted.append("event")
+    } else {
+      skipped.append("event")
+    }
+    if active.testPlan.screen?.selected == true {
+      recordTestSessionSignal(
+        type: "screen_recorded", outcome: "passed", screenName: "sdk_test_screen", feature: "screen")
+      emitted.append("screen")
+    } else {
+      skipped.append("screen")
+    }
+    var experienceDecision: WtsTestSessionExperienceDecision?
+    if options.experiences.enabled,
+      let experience = active.testPlan.experience,
+      experience.selected, experience.available
+    {
+      let response = await runTestSessionExperienceProbe(active)
+      experienceDecision = response.map(\.publicValue)
+      if response?.outcome == "ready" {
+        testSession = active.withTestExperienceDecisionReady()
+        persistTestSession()
+        emitted.append("experiences")
+      } else {
+        skipped.append("experiences")
+      }
+    } else {
+      skipped.append("experiences")
+    }
+    try? await flushTestSessionSignals()
+    return WtsTestSessionProbeRunResult(
+      accepted: active.compatible,
+      emitted: emitted,
+      skipped: skipped,
+      pendingSignals: activeTestSession()?.pendingSignals.count ?? 0,
+      experienceDecision: experienceDecision
+    )
+  }
+
+  /**
+   * Records a manual interaction with the isolated decision returned by
+   * [runTestSessionProbes]. Production Experience lifecycle events are never
+   * copied into the SDK Test & Validate transport.
+   */
+  public func reportTestSessionExperienceInteraction(
+    _ interaction: WtsTestSessionExperienceInteraction
+  ) async -> Bool {
+    guard let active = try? requireActiveTestSession(), active.testExperienceDecisionReady == true else {
+      return false
+    }
+    recordTestSessionSignal(
+      type: interaction == .impression ? "experience_impression" : "experience_action",
+      outcome: "observed",
+      feature: "experiences"
+    )
+    try? await flushTestSessionSignals()
+    return true
+  }
+
   public func flush() async {
     guard appKey != nil else { return }
     do {
@@ -340,6 +661,7 @@ public actor WtsSDK {
       } catch {
         scheduleRetry()
       }
+      try? await flushTestSessionSignals()
       let queue = try store.load()
       guard !queue.isEmpty else {
         retryAttempt = 0
@@ -416,6 +738,296 @@ public actor WtsSDK {
       }
       throw error
     }
+  }
+
+  private func configuredAppKey() throws -> String {
+    guard let appKey else { throw WtsSDKError.notConfigured }
+    return appKey
+  }
+
+  private func activeTestSession() -> PersistedTestSession? {
+    guard let active = testSession else { return nil }
+    guard active.sourceKey == appKey, testSessionExpiry(active.expiresAt) > Date() else {
+      clearTestSession()
+      return nil
+    }
+    return active
+  }
+
+  private func requireActiveTestSession() throws -> PersistedTestSession {
+    guard let active = activeTestSession(), active.compatible else {
+      throw WtsSDKError.invalidEvent(reason: "No compatible SDK Test & Validate session is active.")
+    }
+    return active
+  }
+
+  private func clearTestSession() {
+    testSessionRetryTask?.cancel()
+    testSessionRetryTask = nil
+    testSessionRetryAttempt = 0
+    testSession = nil
+    try? testSessionStore.clear()
+  }
+
+  private func persistTestSession() {
+    guard let active = testSession else { return }
+    do {
+      try testSessionStore.save(active)
+    } catch {
+      testSessionLastErrorCode = WtsSDKError.storage.code
+    }
+  }
+
+  private func recordTestSessionSignal(
+    type: String,
+    outcome: String,
+    method: String? = nil,
+    eventKey: String? = nil,
+    screenName: String? = nil,
+    propertyKeys: [String]? = nil,
+    propertyTypes: [String: String]? = nil,
+    revenue: TestSessionRevenueDescriptor? = nil,
+    resultCode: String? = nil,
+    feature: String? = nil
+  ) {
+    guard var active = activeTestSession(), active.compatible else { return }
+    if (type == "experience_impression" || type == "experience_action")
+      && active.testExperienceDecisionReady != true
+    {
+      return
+    }
+    guard testSessionSignalIsAllowed(
+      active.testPlan,
+      type: type,
+      method: method,
+      eventKey: eventKey,
+      hasRevenue: revenue != nil
+    ) else { return }
+    var pending = active.pendingSignals
+    pending.append(
+      TestSessionSignal(
+        type: type,
+        outcome: outcome,
+        method: method,
+        eventKey: eventKey,
+        screenName: screenName,
+        propertyKeys: propertyKeys.map { Array($0.prefix(20)) },
+        propertyTypes: propertyTypes.map {
+          Dictionary(uniqueKeysWithValues: $0.prefix(20).map { ($0.key, $0.value) })
+        },
+        revenue: revenue,
+        resultCode: resultCode,
+        feature: feature
+      )
+    )
+    while pending.count > 50 { pending.removeFirst() }
+    active = PersistedTestSession(
+      sourceKey: active.sourceKey,
+      sessionId: active.sessionId,
+      participantId: active.participantId,
+      sessionToken: active.sessionToken,
+      expiresAt: active.expiresAt,
+      compatible: active.compatible,
+      requiredSdkVersion: active.requiredSdkVersion,
+      sdkFamily: active.sdkFamily,
+      checks: active.checks,
+      testPlan: active.testPlan,
+      testExperienceDecisionReady: active.testExperienceDecisionReady,
+      pendingSignals: pending
+    )
+    testSession = active
+    persistTestSession()
+    Task { [weak self] in try? await self?.flushTestSessionSignals() }
+  }
+
+  private func testSessionSignalIsAllowed(
+    _ plan: TestSessionPlan,
+    type: String,
+    method: String?,
+    eventKey: String?,
+    hasRevenue: Bool = false
+  ) -> Bool {
+    switch type {
+    case "identity_recorded":
+      guard let profile = plan.profile else { return false }
+      return profile.selected && profile.available
+        && method.map(profile.allowedMethods.contains) == true
+    case "event_recorded":
+      return eventKey.map { key in
+        plan.events.contains(where: { $0.eventKey == key && (!hasRevenue || $0.revenueEnabled) })
+      } ?? false
+    case "screen_recorded":
+      return plan.screen?.selected == true
+    case "deep_link_resolved", "probe_completed":
+      return plan.deepLink?.selected == true && plan.deepLink?.available == true
+    case "experience_impression", "experience_action":
+      return plan.experience?.selected == true && plan.experience?.available == true
+    default:
+      return true
+    }
+  }
+
+  private func flushTestSessionSignals() async throws {
+    guard let active = activeTestSession(), active.compatible, !active.pendingSignals.isEmpty else {
+      return
+    }
+    let batch = Array(active.pendingSignals.prefix(50))
+    do {
+      let response: TestSessionSignalBatchResponse = try await postTest(
+        path: "signals/batch",
+        body: TestSessionSignalBatchRequest(
+          participantId: active.participantId,
+          sessionToken: active.sessionToken,
+          signals: batch
+        )
+      )
+      let terminal = Set(
+        response.accepted + response.duplicates
+          + response.rejected.filter { !$0.retryable }.map(\.clientSignalId)
+      )
+      guard let refreshed = activeTestSession() else { return }
+      testSession = PersistedTestSession(
+        sourceKey: refreshed.sourceKey,
+        sessionId: refreshed.sessionId,
+        participantId: refreshed.participantId,
+        sessionToken: refreshed.sessionToken,
+        expiresAt: refreshed.expiresAt,
+        compatible: refreshed.compatible,
+        requiredSdkVersion: refreshed.requiredSdkVersion,
+        sdkFamily: refreshed.sdkFamily,
+        checks: refreshed.checks,
+        testPlan: refreshed.testPlan,
+        testExperienceDecisionReady: refreshed.testExperienceDecisionReady,
+        pendingSignals: refreshed.pendingSignals.filter { !terminal.contains($0.clientSignalId) }
+      )
+      if response.rejected.contains(where: \.retryable) {
+        scheduleTestSessionRetry()
+      } else {
+        testSessionRetryAttempt = 0
+      }
+      persistTestSession()
+    } catch let error as WtsSDKError {
+      testSessionLastErrorCode = error.code
+      if case .server(let status, _) = error, [401, 403, 404].contains(status) {
+        clearTestSession()
+      } else if case .server(let status, _) = error,
+        (400..<500).contains(status), status != 429
+      {
+        guard let refreshed = activeTestSession() else { return }
+        testSession = PersistedTestSession(
+          sourceKey: refreshed.sourceKey,
+          sessionId: refreshed.sessionId,
+          participantId: refreshed.participantId,
+          sessionToken: refreshed.sessionToken,
+          expiresAt: refreshed.expiresAt,
+          compatible: refreshed.compatible,
+          requiredSdkVersion: refreshed.requiredSdkVersion,
+          sdkFamily: refreshed.sdkFamily,
+          checks: refreshed.checks,
+          testPlan: refreshed.testPlan,
+          testExperienceDecisionReady: refreshed.testExperienceDecisionReady,
+          pendingSignals: Array(refreshed.pendingSignals.dropFirst(batch.count))
+        )
+        persistTestSession()
+      } else {
+        scheduleTestSessionRetry()
+      }
+    } catch {
+      testSessionLastErrorCode = testSessionErrorCode(error)
+      scheduleTestSessionRetry()
+    }
+  }
+
+  private func scheduleTestSessionRetry() {
+    guard testSessionRetryTask == nil, activeTestSession()?.compatible == true else { return }
+    let base = min(pow(2, Double(testSessionRetryAttempt)) * 1, 60)
+    testSessionRetryAttempt = min(testSessionRetryAttempt + 1, 6)
+    let delay = base * Double.random(in: 0.8...1.2)
+    testSessionRetryTask = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+      guard !Task.isCancelled else { return }
+      await self?.clearTestSessionRetryTask()
+      try? await self?.flushTestSessionSignals()
+    }
+  }
+
+  private func clearTestSessionRetryTask() {
+    testSessionRetryTask = nil
+  }
+
+  private func runTestSessionExperienceProbe(
+    _ active: PersistedTestSession
+  ) async -> TestSessionExperienceDecisionResponse? {
+    do {
+      let response: TestSessionExperienceDecisionResponse = try await postTest(
+        path: "experiences/decide",
+        body: TestSessionExperienceDecisionRequest(
+          participantId: active.participantId,
+          sessionToken: active.sessionToken,
+          context: .init(
+            type: "screen_view",
+            pathname: nil,
+            pageName: nil,
+            screenName: "sdk_test_screen",
+            eventKey: nil,
+            properties: nil,
+            locale: WtsMetadata.current.locale
+          )
+        )
+      )
+      return response
+    } catch {
+      testSessionLastErrorCode = testSessionErrorCode(error)
+      return nil
+    }
+  }
+
+  private func postTest<Request: Encodable, Response: Decodable>(
+    path: String,
+    body: Request
+  ) async throws -> Response {
+    try await post(path: "sdk/test/v1/\(path)", body: body, fallbackURL: nil)
+  }
+
+  private func testSessionMetadata(_ sdkFamily: WtsTestSessionSDKFamily) -> TestSessionMetadata {
+    let metadata = WtsMetadata.current
+    return TestSessionMetadata(
+      sdkFamily: sdkFamily.rawValue,
+      appVersion: metadata.appVersion,
+      osVersion: metadata.osVersion,
+      locale: metadata.locale
+    )
+  }
+
+  private var testSessionCapabilities: TestSessionCapabilities {
+    TestSessionCapabilities(
+      deeplink: true,
+      identity: true,
+      screen: true,
+      experiences: options.experiences.enabled,
+      offlineQueue: true
+    )
+  }
+
+  private var testSessionConsent: TestSessionConsent {
+    TestSessionConsent(
+      analytics: "granted",
+      profile: profileConsentGranted,
+      experience: experienceConsent.rawValue
+    )
+  }
+
+  private func testSessionExpiry(_ value: String) -> Date {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = formatter.date(from: value) { return date }
+    formatter.formatOptions = [.withInternetDateTime]
+    return formatter.date(from: value) ?? .distantPast
+  }
+
+  private func testSessionErrorCode(_ error: Error) -> String {
+    if let error = error as? WtsSDKError { return error.code }
+    return "TEST_SESSION_TRANSPORT_ERROR"
   }
 
   private func post<Request: Encodable, Response: Decodable>(
@@ -1022,11 +1634,39 @@ public actor WtsSDK {
       queue.removeFirst()
     }
     try identityStore.save(queue)
+    for method in testSessionIdentityMethods(type: type, operations: operations) {
+      recordTestSessionSignal(
+        type: "identity_recorded",
+        outcome: "observed",
+        method: method,
+        propertyKeys: method == "increment" ? ["sdk_test_increment"] : nil,
+        propertyTypes: method == "increment" ? ["sdk_test_increment": "number"] : nil,
+        feature: "identity"
+      )
+    }
     scheduleFlush(after: 0)
   }
 
   private func requireProfileConsent() throws {
     guard profileConsentGranted else { throw WtsSDKError.profileConsentRequired }
+  }
+
+  private func testSessionIdentityMethods(
+    type: String,
+    operations: UserUpdateOperations?
+  ) -> [String] {
+    switch type {
+    case "identify", "reported_attribution", "reset_identity":
+      return [type]
+    case "update_user":
+      var methods: [String] = []
+      if operations?.set?.isEmpty == false { methods.append("update_user") }
+      if operations?.setOnce?.isEmpty == false { methods.append("set_once") }
+      if operations?.increment?.isEmpty == false { methods.append("increment") }
+      return methods.isEmpty ? ["update_user"] : methods
+    default:
+      return []
+    }
   }
 
   private func validate(attributes: [String: WtsUserValue]) throws {
@@ -1223,6 +1863,69 @@ private func experienceValueMatches(
     }
   default:
     return false
+  }
+}
+
+private extension WtsValue {
+  var testSessionType: String {
+    switch self {
+    case .string: "string"
+    case .number: "number"
+    case .boolean: "boolean"
+    }
+  }
+}
+
+private extension TestSessionHandshakeResponse.Check {
+  var publicValue: WtsTestSessionCheck {
+    WtsTestSessionCheck(key: key, status: status, code: code, message: message)
+  }
+}
+
+private extension PersistedTestSession {
+  func withTestExperienceDecisionReady() -> PersistedTestSession {
+    PersistedTestSession(
+      sourceKey: sourceKey,
+      sessionId: sessionId,
+      participantId: participantId,
+      sessionToken: sessionToken,
+      expiresAt: expiresAt,
+      compatible: compatible,
+      requiredSdkVersion: requiredSdkVersion,
+      sdkFamily: sdkFamily,
+      checks: checks,
+      testPlan: testPlan,
+      testExperienceDecisionReady: true,
+      pendingSignals: pendingSignals
+    )
+  }
+}
+
+private extension TestSessionExperienceDecisionResponse {
+  var publicValue: WtsTestSessionExperienceDecision {
+    WtsTestSessionExperienceDecision(
+      outcome: outcome,
+      reason: reason,
+      testGrant: testGrant.map {
+        WtsTestSessionExperienceGrant(fixtureId: $0.fixtureId, expiresAt: $0.expiresAt)
+      },
+      decision: decision.map { value in
+        WtsTestSessionExperienceCampaign(
+          campaignId: value.campaignId,
+          campaignVersionId: value.campaignVersionId,
+          placement: value.placement,
+          defaultLocale: value.defaultLocale,
+          variant: value.variant.map { variant in
+            WtsTestSessionExperienceVariant(
+              id: variant.id,
+              key: variant.key,
+              content: variant.content,
+              assetURL: variant.asset?.url
+            )
+          }
+        )
+      }
+    )
   }
 }
 
