@@ -52,7 +52,34 @@ extension JSONEncoder {
 extension JSONDecoder {
   static var wts: JSONDecoder {
     let decoder = JSONDecoder()
-    decoder.dateDecodingStrategy = .iso8601
+    // Foundation's built-in `.iso8601` strategy does not consistently accept
+    // fractional seconds across Apple platforms. The API serializes timestamps
+    // with `Date#toISOString()`, so accept both its millisecond form and the
+    // equivalent second-precision form explicitly.
+    decoder.dateDecodingStrategy = .custom { decoder in
+      let container = try decoder.singleValueContainer()
+      let value = try container.decode(String.self)
+      guard let date = WtsISO8601Date.parse(value) else {
+        throw DecodingError.dataCorruptedError(
+          in: container,
+          debugDescription: "Expected an ISO-8601 timestamp with or without fractional seconds."
+        )
+      }
+      return date
+    }
     return decoder
+  }
+}
+
+enum WtsISO8601Date {
+  static func parse(_ value: String) -> Date? {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = formatter.date(from: value) {
+      return date
+    }
+
+    formatter.formatOptions = [.withInternetDateTime]
+    return formatter.date(from: value)
   }
 }

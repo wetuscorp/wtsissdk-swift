@@ -253,6 +253,23 @@ final class WtsSDKTests: XCTestCase {
     )
   }
 
+  func testWtsJSONDecoderAcceptsBackendISO8601TimestampsWithAndWithoutMilliseconds() throws {
+    struct TimestampEnvelope: Decodable {
+      let expiresAt: Date
+    }
+
+    let fractional = try JSONDecoder.wts.decode(
+      TimestampEnvelope.self,
+      from: Data(#"{ "expiresAt": "2099-01-01T00:00:00.000Z" }"#.utf8)
+    )
+    let secondPrecision = try JSONDecoder.wts.decode(
+      TimestampEnvelope.self,
+      from: Data(#"{ "expiresAt": "2099-01-01T00:00:00Z" }"#.utf8)
+    )
+
+    XCTAssertEqual(fractional.expiresAt, secondPrecision.expiresAt)
+  }
+
   func testManualExperienceLifecycleIsSingleDeliveryIdempotentAndRejectsStaleHandles() async throws {
     let fixture = try Self.signedContextualExperienceFixture()
     let recorder = ManualPresentationRecorder()
