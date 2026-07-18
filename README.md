@@ -2,11 +2,11 @@
 
 Official, source-based SDK for wts.is deep links and mobile attribution. It resolves verified Universal Links, returns an application-owned route, and queues registered custom events and revenue safely while offline. The SDK never navigates your UI.
 
-> `0.3.0-alpha.1` source line · Mobile Protocol V3 + Identity V1 + Experiences V1 + SDK Test Session V1 · iOS 15+ · Swift 5.9+
+> `0.4.0-alpha.1` source line · Mobile Protocol V3 + Identity V1 + Experiences V1 + SDK Test Session V1 · iOS 15+ · Swift 5.9+
 
 > **Release note:** SDK Test & Validate APIs below are source-line APIs. Use
 > them only after the matching Swift Package/CocoaPods release has been
-> published. This document does not claim that `0.3.0-alpha.1` is already
+> published. This document does not claim that `0.4.0-alpha.1` is already
 > available through either registry.
 
 ## Installation
@@ -149,6 +149,10 @@ await WtsSDK.shared.onExperienceAvailable { presentation in
     }
 }
 ```
+
+The handle is opaque and process-local: do not persist, log, or treat it as an
+authorization token. The SDK validates every lifecycle call against the active
+presentation, so forged or stale handles are rejected.
 
 `presentNextExperience()` and `dismissCurrentExperience()` are automatic-mode
 APIs and return no manual presentation. HTTPS deep-link actions always require
