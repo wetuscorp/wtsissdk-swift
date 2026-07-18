@@ -15,6 +15,7 @@ public actor WtsSDK {
   private let identityBindingStore: IdentityBindingStoring
   private let experienceInteractionStore: ExperienceInteractionStoring
   private let testSessionStore: TestSessionStoring
+  private let experienceClock: @Sendable () -> Date
   private let encoder = JSONEncoder.wts
   private let decoder = JSONDecoder.wts
   private var appKey: String?
@@ -38,7 +39,9 @@ public actor WtsSDK {
   private var experienceActionHandler: (@Sendable (WtsExperience, WtsExperienceAction) -> Bool)?
   private var experienceLastErrorCode: String?
   private var presentingExperience: WtsExperience?
+  private var experienceSessionOverlayPresentations = 0
   private var experienceSessionImpressions = 0
+  private var experiencePresentationCooldownUntil: Date?
   private var experienceTestDeviceToken = UUID().uuidString.lowercased()
   private var testSession: PersistedTestSession?
   private var testSessionLastErrorCode: String?
@@ -53,6 +56,10 @@ public actor WtsSDK {
     var terminalReason: WtsExperienceDismissReason?
   }
 
+  private static let maximumExperienceSessionOverlayPresentations = 2
+  private static let maximumExperienceSessionImpressions = 5
+  private static let experiencePresentationCooldown: TimeInterval = 3
+
   public init() {
     transport = URLSessionTransport()
     identity = KeychainInstallIdentity()
@@ -61,6 +68,7 @@ public actor WtsSDK {
     identityBindingStore = FileIdentityBindingStore()
     experienceInteractionStore = FileExperienceInteractionStore()
     testSessionStore = FileTestSessionStore()
+    experienceClock = { Date() }
   }
 
   init(
@@ -71,7 +79,8 @@ public actor WtsSDK {
     identityBindingStore: IdentityBindingStoring = FileIdentityBindingStore(),
     experienceInteractionStore: ExperienceInteractionStoring =
       FileExperienceInteractionStore(),
-    testSessionStore: TestSessionStoring = FileTestSessionStore()
+    testSessionStore: TestSessionStoring = FileTestSessionStore(),
+    experienceClock: @escaping @Sendable () -> Date = { Date() }
   ) {
     self.transport = transport
     self.identity = identity
@@ -80,6 +89,7 @@ public actor WtsSDK {
     self.identityBindingStore = identityBindingStore
     self.experienceInteractionStore = experienceInteractionStore
     self.testSessionStore = testSessionStore
+    self.experienceClock = experienceClock
   }
 
   public func configure(appKey: String, options: WtsOptions = WtsOptions()) throws {
@@ -377,8 +387,9 @@ public actor WtsSDK {
 
   public func presentNextExperience() async -> WtsExperience? {
     guard options.experiences.renderMode == .automatic else { return nil }
-    guard presentingExperience == nil, !experienceQueue.isEmpty,
-      experienceSessionImpressions < 2
+    guard experiencePresentationAdmissionFailureCode() == nil,
+      presentingExperience == nil,
+      !experienceQueue.isEmpty
     else { return nil }
     let experience = experienceQueue.removeFirst()
     await presentAutomatically(experience)
@@ -402,6 +413,9 @@ public actor WtsSDK {
     guard isManualExperienceRuntimeEnabled else {
       return manualExperienceUnavailableOutcome
     }
+    if let code = experiencePresentationAdmissionFailureCode() {
+      return .init(accepted: false, code: code)
+    }
     guard var state = manualExperienceStates[handle.exposureId] else {
       return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_FOUND")
     }
@@ -419,6 +433,7 @@ public actor WtsSDK {
     state.renderAcknowledged = true
     manualExperienceStates[handle.exposureId] = state
     presentingExperience = state.experience
+    experienceSessionOverlayPresentations += 1
     await recordExperience(state.experience, type: "render_started")
     await recordExperience(state.experience, type: "render_succeeded")
     return .init(accepted: true)
@@ -442,6 +457,9 @@ public actor WtsSDK {
       state.terminalReason == nil
     else {
       return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_CURRENT")
+    }
+    guard experienceSessionImpressions < Self.maximumExperienceSessionImpressions else {
+      return .init(accepted: false, code: "EXPERIENCE_SESSION_CAP_REACHED")
     }
     state.impressionAcknowledged = true
     manualExperienceStates[handle.exposureId] = state
@@ -517,14 +535,13 @@ public actor WtsSDK {
     state.terminalReason = reason
     manualExperienceStates[handle.exposureId] = state
     presentingExperience = nil
-    switch reason {
-    case .dismissed:
-      await recordExperience(state.experience, type: "dismissed")
-    case .autoClosed:
-      await recordExperience(state.experience, type: "auto_closed")
-    case .renderFailed:
-      await recordExperience(state.experience, type: "render_failed", failureCode: failureCode)
-    }
+    await recordExperience(
+      state.experience,
+      type: experienceTerminalInteractionType(reason),
+      failureCode: reason == .renderFailed ? failureCode : nil
+    )
+    experiencePresentationCooldownUntil = experienceClock()
+      .addingTimeInterval(Self.experiencePresentationCooldown)
     scheduleNextManualExperienceAfterCooldown()
     return .init(accepted: true)
   }
@@ -540,6 +557,33 @@ public actor WtsSDK {
     )
   }
 
+  /// Returns a stable reason when delivery must stop before an Experience is
+  /// rendered. Both automatic and manual paths call this boundary so an
+  /// expired signed manifest, session safety cap, or active cooldown cannot be
+  /// bypassed by a host callback.
+  private func experiencePresentationAdmissionFailureCode() -> String? {
+    if let expiresAt = experienceManifestExpiresAt,
+      (experienceManifest == nil || expiresAt <= experienceClock())
+    {
+      try? clearExperienceRuntime(clearInteractionQueue: false)
+      experienceLastErrorCode = "EXPERIENCE_MANIFEST_EXPIRED"
+      return "EXPERIENCE_MANIFEST_EXPIRED"
+    }
+    guard experienceManifest != nil else { return "EXPERIENCE_MANIFEST_UNAVAILABLE" }
+    if let cooldownUntil = experiencePresentationCooldownUntil, cooldownUntil > experienceClock() {
+      return "EXPERIENCE_COOLDOWN_ACTIVE"
+    }
+    guard
+      experienceSessionOverlayPresentations < Self.maximumExperienceSessionOverlayPresentations,
+      experienceSessionImpressions < Self.maximumExperienceSessionImpressions
+    else {
+      clearQueuedExperiences()
+      experienceLastErrorCode = "EXPERIENCE_SESSION_CAP_REACHED"
+      return "EXPERIENCE_SESSION_CAP_REACHED"
+    }
+    return nil
+  }
+
   private func clearExperienceRuntime(clearInteractionQueue: Bool) throws {
     experienceManifest = nil
     experienceCandidateVersionIds = []
@@ -549,6 +593,7 @@ public actor WtsSDK {
     clearQueuedExperiences()
     manualExperienceStates.removeAll()
     presentingExperience = nil
+    experiencePresentationCooldownUntil = nil
     #if canImport(UIKit)
       Task { @MainActor in WtsExperiencePresenter.dismissCurrent(notify: false) }
     #endif
@@ -560,6 +605,7 @@ public actor WtsSDK {
   private func clearQueuedExperiences() {
     for experience in experienceQueue {
       manualExperienceStates.removeValue(forKey: experience.exposureId)
+      experienceGrants.removeValue(forKey: experience.assignmentId)
     }
     experienceQueue = []
     offeredManualExperienceId = nil
@@ -586,7 +632,9 @@ public actor WtsSDK {
   }
 
   private func notifyNextManualExperienceIfAvailable() {
-    guard isManualExperienceRuntimeEnabled, presentingExperience == nil,
+    guard isManualExperienceRuntimeEnabled,
+      experiencePresentationAdmissionFailureCode() == nil,
+      presentingExperience == nil,
       let handler = experienceHandler,
       let next = experienceQueue.first,
       offeredManualExperienceId != next.exposureId
@@ -1342,7 +1390,7 @@ public actor WtsSDK {
       verificationKeys: options.experiences.manifestVerificationKeys,
       expectedSourceKey: appKey,
       decoder: decoder
-    ), manifest.expiresAt > Date() else {
+    ), manifest.expiresAt > experienceClock() else {
       throw WtsSDKError.invalidResponse(fallbackURL: nil)
     }
     experienceManifest = manifest
@@ -1350,7 +1398,7 @@ public actor WtsSDK {
     experienceManifestExpiresAt = manifest.expiresAt
     experienceManifestRefreshAt = min(
       manifest.expiresAt,
-      Date().addingTimeInterval(5 * 60)
+      experienceClock().addingTimeInterval(5 * 60)
     )
     experienceLastErrorCode = nil
   }
@@ -1361,7 +1409,7 @@ public actor WtsSDK {
       experienceConsent != .personalized || profileConsentGranted
     else { return }
     do {
-      if experienceManifestRefreshAt == nil || experienceManifestRefreshAt! <= Date() {
+      if experienceManifestRefreshAt == nil || experienceManifestRefreshAt! <= experienceClock() {
         try await refreshExperienceManifest()
       }
       if experienceConsent == .personalized, !identityBound {
@@ -1423,7 +1471,8 @@ public actor WtsSDK {
         guard
           !experienceQueue.contains(where: {
             $0.campaignVersionId == experience.campaignVersionId
-          })
+          }),
+          presentingExperience?.campaignVersionId != experience.campaignVersionId
         else { continue }
         experienceGrants[experience.assignmentId] = decision.grant
         experienceQueue.append(experience)
@@ -1438,8 +1487,15 @@ public actor WtsSDK {
         if experienceQueue.count > 5 {
           let dropped = experienceQueue.removeLast()
           manualExperienceStates.removeValue(forKey: dropped.exposureId)
+          experienceGrants.removeValue(forKey: dropped.assignmentId)
         }
-        for type in ["assigned_variant", "eligible", "queued"] {
+        let survivedQueueCap = experienceQueue.contains {
+          $0.exposureId == experience.exposureId
+        }
+        for type in survivedQueueCap
+          ? ["assigned_variant", "eligible", "queued"]
+          : ["assigned_variant", "eligible"]
+        {
           interactions.append(
             experienceInteraction(
               decision: decision,
@@ -1620,6 +1676,22 @@ public actor WtsSDK {
     guard presentingExperience == nil else { return }
     presentingExperience = experience
     await recordExperience(experience, type: "render_started")
+    if experience.content.delaySeconds > 0 {
+      try? await Task.sleep(
+        nanoseconds: UInt64(experience.content.delaySeconds * 1_000_000_000)
+      )
+      guard !Task.isCancelled else {
+        presentingExperience = nil
+        return
+      }
+    }
+    guard presentingExperience?.exposureId == experience.exposureId else { return }
+    guard experiencePresentationAdmissionFailureCode() == nil else {
+      // `experiencePresentationAdmissionFailureCode` clears stale runtime
+      // state itself. Do not emit a post-expiry interaction through a grant
+      // that is no longer authorized.
+      return
+    }
     #if canImport(UIKit)
       let presented = await WtsExperiencePresenter.present(
         experience,
@@ -1629,11 +1701,12 @@ public actor WtsSDK {
         onAction: { [weak self] action in
           Task { await self?.handleExperienceAction(experience, action: action) }
         },
-        onDismiss: { [weak self] in
-          Task { await self?.experienceDidDismiss(experience) }
+        onDismiss: { [weak self] reason in
+          Task { await self?.experienceDidDismiss(experience, reason: reason) }
         }
       )
       if presented {
+        experienceSessionOverlayPresentations += 1
         await recordExperience(experience, type: "render_succeeded")
       } else {
         presentingExperience = nil
@@ -1655,15 +1728,23 @@ public actor WtsSDK {
 
   private func experienceDidImpress(_ experience: WtsExperience) async {
     guard presentingExperience?.exposureId == experience.exposureId else { return }
+    guard experienceSessionImpressions < Self.maximumExperienceSessionImpressions else { return }
     experienceSessionImpressions += 1
     await recordExperience(experience, type: "impression")
   }
 
-  private func experienceDidDismiss(_ experience: WtsExperience) async {
+  private func experienceDidDismiss(
+    _ experience: WtsExperience,
+    reason: WtsExperienceDismissReason
+  ) async {
     guard presentingExperience?.exposureId == experience.exposureId else { return }
     presentingExperience = nil
-    await recordExperience(experience, type: "dismissed")
-    try? await Task.sleep(nanoseconds: 3_000_000_000)
+    await recordExperience(experience, type: experienceTerminalInteractionType(reason))
+    experiencePresentationCooldownUntil = experienceClock()
+      .addingTimeInterval(Self.experiencePresentationCooldown)
+    try? await Task.sleep(
+      nanoseconds: UInt64(Self.experiencePresentationCooldown * 1_000_000_000)
+    )
     _ = await presentNextExperience()
   }
 
@@ -2146,6 +2227,17 @@ private func experienceValueMatches(
     }
   default:
     return false
+  }
+}
+
+func experienceTerminalInteractionType(_ reason: WtsExperienceDismissReason) -> String {
+  switch reason {
+  case .dismissed:
+    return "dismissed"
+  case .autoClosed:
+    return "auto_closed"
+  case .renderFailed:
+    return "render_failed"
   }
 }
 

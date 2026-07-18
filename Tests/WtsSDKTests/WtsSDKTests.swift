@@ -447,6 +447,111 @@ final class WtsSDKTests: XCTestCase {
     XCTAssertEqual(recorder.count, 1)
   }
 
+  func testExpiredManifestClearsManualPresentationBeforeRender() async throws {
+    let clock = MutableExperienceClock(Date(timeIntervalSince1970: 1_800_000_000))
+    let fixture = try Self.signedContextualExperienceFixture(
+      expiresAt: Self.experienceTimestamp(clock.now().addingTimeInterval(60))
+    )
+    let recorder = ManualPresentationRecorder()
+    let sdk = WtsSDK(
+      transport: Self.experienceTransport(fixture: fixture),
+      identity: StaticIdentity(),
+      store: MemoryEventStore(),
+      identityStore: MemoryIdentityMutationStore(),
+      experienceInteractionStore: MemoryExperienceInteractionStore(),
+      experienceClock: { clock.now() }
+    )
+    try await sdk.configure(
+      appKey: "public-app-key",
+      options: WtsOptions(
+        experiences: WtsExperienceOptions(
+          enabled: true,
+          renderMode: .manual,
+          manifestVerificationKeys: fixture.verificationKeys
+        )
+      )
+    )
+    await sdk.onExperienceAvailable { recorder.append($0) }
+    let consentResult = try await sdk.setExperienceConsent(.contextual)
+    XCTAssertEqual(consentResult, .accepted)
+    try await sdk.screen("checkout")
+    let presentation = try XCTUnwrap(recorder.last)
+
+    clock.advance(by: 61)
+    let outcome = await sdk.acknowledgeExperienceRender(presentation.handle)
+    let diagnostics = await sdk.getExperienceDiagnostics()
+
+    XCTAssertFalse(outcome.accepted)
+    XCTAssertEqual(outcome.code, "EXPERIENCE_MANIFEST_EXPIRED")
+    XCTAssertEqual(diagnostics.queued, 0)
+    XCTAssertFalse(diagnostics.presenting)
+    XCTAssertEqual(diagnostics.lastErrorCode, "EXPERIENCE_MANIFEST_EXPIRED")
+  }
+
+  func testManualExperienceUsesSharedCapsAndDoesNotQueueCurrentPresentation() async throws {
+    let clock = MutableExperienceClock(Date(timeIntervalSince1970: 1_800_000_000))
+    let fixture = try Self.signedContextualExperienceFixture(
+      expiresAt: Self.experienceTimestamp(clock.now().addingTimeInterval(600))
+    )
+    let recorder = ManualPresentationRecorder()
+    let sdk = WtsSDK(
+      transport: Self.experienceTransport(fixture: fixture),
+      identity: StaticIdentity(),
+      store: MemoryEventStore(),
+      identityStore: MemoryIdentityMutationStore(),
+      experienceInteractionStore: MemoryExperienceInteractionStore(),
+      experienceClock: { clock.now() }
+    )
+    try await sdk.configure(
+      appKey: "public-app-key",
+      options: WtsOptions(
+        experiences: WtsExperienceOptions(
+          enabled: true,
+          renderMode: .manual,
+          manifestVerificationKeys: fixture.verificationKeys
+        )
+      )
+    )
+    await sdk.onExperienceAvailable { recorder.append($0) }
+    let consentResult = try await sdk.setExperienceConsent(.contextual)
+    XCTAssertEqual(consentResult, .accepted)
+
+    try await sdk.screen("checkout")
+    let first = try XCTUnwrap(recorder.last)
+    let firstRender = await sdk.acknowledgeExperienceRender(first.handle)
+    XCTAssertTrue(firstRender.accepted)
+
+    // The same campaign cannot enter the queue while it is already presented.
+    try await sdk.screen("checkout")
+    XCTAssertEqual(recorder.count, 1)
+    let duplicateDiagnostics = await sdk.getExperienceDiagnostics()
+    XCTAssertEqual(duplicateDiagnostics.queued, 0)
+
+    let firstDismissal = await sdk.dismissExperience(first.handle)
+    XCTAssertTrue(firstDismissal.accepted)
+    clock.advance(by: 4)
+    try await sdk.screen("checkout")
+    let second = try XCTUnwrap(recorder.last)
+    XCTAssertEqual(recorder.count, 2)
+    let secondRender = await sdk.acknowledgeExperienceRender(second.handle)
+    XCTAssertTrue(secondRender.accepted)
+    let secondDismissal = await sdk.dismissExperience(second.handle)
+    XCTAssertTrue(secondDismissal.accepted)
+
+    clock.advance(by: 4)
+    try await sdk.screen("checkout")
+    let diagnostics = await sdk.getExperienceDiagnostics()
+    XCTAssertEqual(recorder.count, 2)
+    XCTAssertEqual(diagnostics.queued, 0)
+    XCTAssertEqual(diagnostics.lastErrorCode, "EXPERIENCE_SESSION_CAP_REACHED")
+  }
+
+  func testAutomaticExperienceAutoCloseUsesDedicatedInteractionType() {
+    XCTAssertEqual(experienceTerminalInteractionType(.autoClosed), "auto_closed")
+    XCTAssertEqual(experienceTerminalInteractionType(.dismissed), "dismissed")
+    XCTAssertEqual(experienceTerminalInteractionType(.renderFailed), "render_failed")
+  }
+
   func testHTTPSDeepLinkCannotBypassHostAllowlistWithSchemeAllowlist() async throws {
     let fixture = try Self.signedContextualExperienceFixture()
     let recorder = ManualPresentationRecorder()
@@ -874,6 +979,12 @@ final class WtsSDKTests: XCTestCase {
     { "accepted": [], "duplicates": [], "rejected": [] }
     """.utf8)
 
+  private static func experienceTimestamp(_ value: Date) -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter.string(from: value)
+  }
+
   private struct SignedExperienceFixture: Sendable {
     let response: Data
     let verificationKeys: [String: String]
@@ -1045,6 +1156,27 @@ private final class ManualPresentationRecorder: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return presentations.last
+  }
+}
+
+private final class MutableExperienceClock: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: Date
+
+  init(_ value: Date) {
+    self.value = value
+  }
+
+  func now() -> Date {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
+  }
+
+  func advance(by interval: TimeInterval) {
+    lock.lock()
+    value = value.addingTimeInterval(interval)
+    lock.unlock()
   }
 }
 
