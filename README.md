@@ -1,293 +1,100 @@
 # wts.is Swift SDK
 
-Official, source-based SDK for wts.is deep links and mobile attribution. It resolves verified Universal Links, returns an application-owned route, and queues registered custom events and revenue safely while offline. The SDK never navigates your UI.
+Official iOS SDK for wts.is deep links, analytics, identity, and deployless Experiences.
 
-> `0.4.0-alpha.1` prerelease · Mobile Protocol V3 + Identity V1 + Experiences V1 + SDK Test Session V1 · iOS 15+ · Swift 5.9+
+> `0.5.0-alpha.1` · Mobile Protocol V4 · Experiences Protocol V2 · SDK Test Session V2 · iOS 15+ · Swift 5.9+
 
-> **Prerelease:** Pin this exact version while evaluating the alpha. Public API
-> compatibility is maintained within this prerelease; production rollout should
-> follow the matching dashboard and SDK readiness checks.
+Pin this alpha exactly. The dashboard, backend, Swift/Android cores, and Flutter/React Native wrappers must use the coordinated `0.5.0-alpha.1` release.
 
-## Installation
+## Install
 
-Use one dependency manager per application target. Swift Package Manager and CocoaPods ship the same source, module name, privacy manifest, minimum deployment target, and SDK version.
-
-### Swift Package Manager
-
-In Xcode choose **File → Add Package Dependencies** and enter:
+Swift Package Manager:
 
 ```text
 https://github.com/wetuscorp/wtsissdk-swift.git
+Exact Version: 0.5.0-alpha.1
 ```
 
-Select **Exact Version** and enter `0.4.0-alpha.1`, link the `WtsSDK` product
-to the application target, then:
-
-```swift
-import WtsSDK
-```
-
-### CocoaPods
-
-Add the CDN source and pin the same SDK version in your `Podfile`:
+CocoaPods:
 
 ```ruby
-source 'https://cdn.cocoapods.org/'
-
-platform :ios, '15.0'
-
-target 'YourApp' do
-  pod 'WtsSDK', '0.4.0-alpha.1'
-end
+pod 'WtsSDK', '0.5.0-alpha.1'
 ```
 
-Then install the dependency:
+## One-time integration
 
-```bash
-bundle exec pod install
-```
-
-Open the generated `.xcworkspace` and import `WtsSDK`. Do not add the package through Swift Package Manager when the same application target already receives it through CocoaPods.
-
-## Configure and handle links
+The host owns the consent UI. Configure once, restore the stored decision to avoid asking twice, and send the decision when the user makes it:
 
 ```swift
 import WtsSDK
 
 try await WtsSDK.shared.configure(appKey: "YOUR_PUBLIC_APP_KEY")
 
-func open(_ url: URL) async {
-    do {
-        let link = try await WtsSDK.shared.handle(url: url)
-        guard allowedRoutes.contains(link.path) else { return }
-        router.navigate(path: link.path, parameters: link.parameters)
-    } catch let error as WtsSDKError {
-        if let fallback = error.fallbackURL { await openInBrowser(fallback) }
-    } catch { /* application logging */ }
+switch await WtsSDK.shared.getConsentState() {
+case .pending:
+    showConsentUI()
+case .granted, .denied:
+    break
 }
+
+try await WtsSDK.shared.setConsent(.granted) // or .denied
 ```
 
-Forward URLs from SwiftUI `onOpenURL` or `application(_:continue:restorationHandler:)`. Configure the app's Associated Domains entitlement with the exact host shown in the wts.is dashboard. Universal Link association is required on both the app and domain.
-
-## Events and revenue
-
-Register event keys and typed properties in the dashboard first. Revenue uses a decimal string internally to avoid binary rounding.
+After grant, existing registered events automatically drive campaigns selected in the dashboard:
 
 ```swift
 try await WtsSDK.shared.track(
     eventKey: "purchase_completed",
-    properties: ["plan": .string("pro"), "trial": .boolean(false)],
+    properties: ["plan": .string("pro")],
     revenue: WtsRevenue(amount: "49.90", currency: "TRY")
 )
-await WtsSDK.shared.flush() // optional; automatic flushing is enabled
+
+try await WtsSDK.shared.screen("checkout")
 ```
 
-The queue is atomic, FIFO and bounded to 100 events/1 MiB. Batches are capped at 50 events/64 KiB. Retriable failures use exponential backoff with jitter; accepted, duplicate and permanently rejected IDs are removed.
+No campaign key, placement key, verification key, allowlist, manual renderer, or acknowledgement API belongs in the host application. The SDK refreshes root-verified, source-bound configuration in the foreground and presents supported modal or bottom-sheet Experiences automatically.
 
-## Screens and Experiences
+Pending and denied states create no install identity and perform no analytics, identity, attribution, Experience, or test-session storage/network work. `handle(url:)` remains available through the data-minimized Mobile V4 functional resolver. Grant enables normal attribution; denial clears local SDK data and closes an active Experience.
 
-Screen views are built-in Mobile Protocol V3 events and do not require a
-custom-event definition:
+## Actions and diagnostics
 
-```swift
-try await WtsSDK.shared.screen(
-    "checkout",
-    properties: [
-        "cart_total": .number(749.90),
-        "currency": .string("TRY"),
-        "item_count": .number(3)
-    ]
-)
-```
-
-Experiences remains disabled until the host opts in and supplies a separate
-consent decision:
+HTTPS web actions and safe deep links are handled by the SDK. Internal routes and custom callbacks are optional advanced integrations:
 
 ```swift
-var options = WtsOptions()
-options.experiences = WtsExperienceOptions(
-    enabled: true,
-    renderMode: .automatic,
-    // Fetch these public SPKI DER keys from the authenticated wts.is API.
-    manifestVerificationKeys: [
-        "active-kid": "BASE64_SPKI_DER_PUBLIC_KEY"
-    ],
-    allowedInternalRoutes: ["/checkout", "/account"],
-    allowedCallbackKeys: ["apply_offer"],
-    allowedDeepLinkHosts: ["go.example.com"],
-    allowedDeepLinkSchemes: ["example"],
-    allowedWebOrigins: ["https://www.example.com"]
-)
-try await WtsSDK.shared.configure(appKey: "YOUR_PUBLIC_APP_KEY", options: options)
-try await WtsSDK.shared.setExperienceConsent(.contextual)
-```
-
-Obtain the public verification-key map from
-`GET /api/v1/organizations/:organizationId/experiences/manifest-verification-keys`
-with an authenticated dashboard or Integration API request. Never copy a
-private signing key into an app. The SDK uses only the signed payload and also
-requires its source key to match the configured app key. Use `.personalized`
-only after profile consent. `.pending` makes no Experience request; `.denied`
-clears local Experience state and unsent interactions. Automatic mode uses
-native modal or bottom-sheet presentation.
-
-Manual mode delivers each eligible `WtsExperienceManualPresentation` only once.
-The host renders it and acknowledges its lifecycle with the supplied handle:
-
-```swift
-await WtsSDK.shared.onExperienceAvailable { presentation in
-    // Render presentation.experience with the host UI.
-    Task {
-        let rendered = await WtsSDK.shared.acknowledgeExperienceRender(presentation.handle)
-        let impressed = await WtsSDK.shared.acknowledgeExperienceImpression(presentation.handle)
-        let action = await WtsSDK.shared.reportExperienceAction(
-            presentation.handle,
-            actionId: "continue"
-        )
-        let dismissed = await WtsSDK.shared.dismissExperience(presentation.handle)
-        _ = (rendered, impressed, action, dismissed)
+await WtsSDK.shared.onExperienceAction { experience, action in
+    guard action.type == .openInternalRoute, let route = action.target else {
+        return false
     }
+    return router.open(route)
 }
 ```
 
-The handle is opaque and process-local: do not persist, log, or treat it as an
-authorization token. The SDK validates every lifecycle call against the active
-presentation, so forged or stale handles are rejected.
+Returning `false`, omitting the handler, or failing the action records `unhandled` and keeps the Experience open. Unsafe schemes including `http`, `about`, `data`, `file`, and `javascript` are rejected.
 
-`presentNextExperience()` and `dismissCurrentExperience()` are automatic-mode
-APIs and return no manual presentation. HTTPS deep-link actions always require
-an allowlisted host; `allowedDeepLinkSchemes` is for non-HTTPS custom schemes
-only. The unsafe scheme set (`about`, `blob`, `data`, `file`, `filesystem`,
-`http`, `javascript`, and `vbscript`) is rejected even when configured
-explicitly.
-Application callbacks remain behind the configured allowlist.
+```swift
+let diagnostics = await WtsSDK.shared.getExperienceDiagnostics()
+await WtsSDK.shared.dismissCurrentExperience() // emergency host control
+```
 
-Experience interactions use their own persistent, bounded FIFO queue and UUID
-idempotency. Impressions are emitted after one uninterrupted second of native
-visibility. `dismissCurrentExperience()` and
-`getExperienceDiagnostics()` provide lifecycle and integration control.
+## Identity and links
 
-Personalized delivery requires both profile consent and a server-accepted
-`identify` binding for the configured source. Until that binding is ready, the
-SDK evaluates only signed contextual campaigns and never calls the personalized
-decision endpoint. Calling `resetIdentity()` or denying profile consent clears
-the local binding state immediately.
+Identity APIs use the same unified grant:
 
-To test a draft Experience revision on this installation, read
-`await WtsSDK.shared.getExperienceDiagnostics().testDeviceToken` and grant it
-to the matching Mobile App from the dashboard. The random source-scoped token
-contains no install, user, or profile identifier, and test traffic is excluded
-from customer analytics and usage.
+```swift
+try await WtsSDK.shared.identify("customer_1842", attributes: ["plan": .string("enterprise")])
+```
+
+Forward Universal Links to `handle(url:)`, validate the returned application route, and navigate in host code. `linkId` and `attributionId` are nil for pre-consent functional resolves.
 
 ## SDK Test & Validate
 
-SDK Test & Validate is a dashboard-issued, short-lived validation session. Its
-bounded retry queue is isolated from production events, identities,
-attribution, and Experience delivery. Do not hardcode, log, or persist a
-pairing URL or token outside the SDK.
+Test Session V2 is available only after unified consent is granted. A ready test Experience is shown through the automatic renderer in an isolated test queue and never enters the production Experience queue.
 
-The dashboard QR code uses this canonical form:
+## Trust and release
 
-```text
-https://<mobile-app-host>/_wts/test/pair?pairing=<dashboard-issued-token>
-```
-
-Inspect each incoming URL for that pairing route and join it **before** normal
-Universal Link handling. A pairing URL is not an application route and must
-not be passed to `handle(url:)`.
-
-```swift
-private func isWtsTestPairing(_ url: URL) -> Bool {
-    url.scheme == "https" && url.path == "/_wts/test/pair"
-}
-
-func open(_ url: URL) async {
-    if isWtsTestPairing(url) {
-        do {
-            let pairing = try WtsTestSessionPairing.parse(url.absoluteString)
-            let joined = await WtsSDK.shared.joinTestSession(pairing)
-            showSdkTestChecks(joined.checks)
-        } catch {
-            showSdkTestPairingError(error)
-        }
-        return
-    }
-
-    // Normal production behavior stays unchanged.
-    do {
-        let link = try await WtsSDK.shared.handle(url: url)
-        guard allowedRoutes.contains(link.path) else { return }
-        router.navigate(path: link.path, parameters: link.parameters)
-    } catch let error as WtsSDKError {
-        if let fallback = error.fallbackURL { await openInBrowser(fallback) }
-    } catch { /* application logging */ }
-}
-```
-
-Use diagnostics and the dashboard-selected test plan without producing normal
-analytics:
-
-```swift
-let diagnostics = WtsSDK.shared.getTestSessionDiagnostics()
-let probes = try await WtsSDK.shared.runTestSessionProbes()
-
-// This decision is test-only. Render the typed content in a test preview,
-// never through the normal Experiences runtime.
-if probes.experienceDecision?.outcome == "ready" {
-    presentTestExperiencePreview(probes.experienceDecision!)
-    _ = await WtsSDK.shared.reportTestSessionExperienceInteraction(.impression)
-}
-```
-
-Report `.action` only after a real action in that manual test preview. It is
-accepted only after the isolated decision is ready; production Experience
-lifecycle signals are never mirrored to the test session. Use
-`probeTestSessionUrl(_:)` for an event-free resolver check, and call
-`leaveTestSession()` when the operator finishes. Expiry also clears the
-session.
-
-## User identity and reported attribution
-
-Profile operations require an explicit consent decision from the host application. Use your own stable, opaque customer ID rather than an email address as `externalUserId`; the value is case-sensitive and is not trimmed or normalized.
-
-```swift
-try WtsSDK.shared.setProfileConsent(.granted)
-
-try WtsSDK.shared.identify(
-    "customer_1842",
-    attributes: [
-        "email": .string("user@example.com"),
-        "plan": .string("enterprise"),
-        "subscribed": .boolean(true)
-    ]
-)
-
-try WtsSDK.shared.updateUser(
-    WtsUserUpdate(
-        set: ["plan": .string("business")],
-        setOnce: ["signup_channel": .string("partner")],
-        increment: ["lifetime_orders": 1]
-    )
-)
-
-try WtsSDK.shared.setReportedAttribution(
-    WtsReportedAttribution(
-        source: "newsletter",
-        medium: "email",
-        campaign: "summer_2026",
-        externalRef: "mailing-482"
-    )
-)
-```
-
-Call `resetIdentity()` on logout. It removes the current profile binding, rotates the anonymous/session context and preserves the installation identity used for deterministic mobile delivery. Setting profile consent to `.denied` also queues a binding reset while anonymous analytics remains available. Identity mutations use a persistent FIFO queue and are flushed before events.
-
-## Platform behavior
-
-- `handle(url:)` has a 2-second default timeout and a 100-entry/60-second memory cache.
-- Errors are typed and retain the original web fallback URL where applicable.
-- The install UUID is generated locally and stored in Keychain.
-- `getDeferredDeepLink()` intentionally returns `nil` on iOS; deterministic post-install deferred attribution is not promised.
-- No IDFA, pasteboard attribution, GAID, fingerprinting, or automatic navigation.
-
-See the installable sample in `Examples/Quickstart`, [security policy](SECURITY.md), and [support policy](SUPPORT.md). Full integration documentation: https://wts.is/en/resources/docs/sdk-ios
+The long-lived root private key must never enter this repository or backend. The
+release environment supplies the ceremony-produced base64 SPKI Ed25519 public
+key as `WTS_EXPERIENCE_ROOT_PUBLIC_KEY`; the release workflow validates and
+embeds it into `Sources/WtsSDK/ExperienceTrust.swift` before compiling. It
+fails closed if the variable is missing, malformed, or not Ed25519. Normal
+online leaf-key rotation then requires no app deployment.

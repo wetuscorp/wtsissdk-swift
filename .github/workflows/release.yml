@@ -8,13 +8,17 @@ jobs:
   release:
     runs-on: macos-15
     environment: release
+    env:
+      WTS_EXPERIENCE_ROOT_PUBLIC_KEY: ${{ vars.WTS_EXPERIENCE_ROOT_PUBLIC_KEY }}
     steps:
       - uses: actions/checkout@v5
       - name: Verify tag and contracts
         run: |
           test "${GITHUB_REF_NAME}" = "$(ruby -e 'puts File.read("WtsSDK.podspec")[/s.version = '\''([^'\'']+)/, 1]')"
-          chmod +x scripts/verify-contracts.sh
+          chmod +x scripts/verify-contracts.sh scripts/embed-release-root.sh scripts/verify-release-root.sh
           scripts/verify-contracts.sh
+          scripts/embed-release-root.sh
+          scripts/verify-release-root.sh
       - run: swift test --parallel
       - run: pod lib lint WtsSDK.podspec --allow-warnings
       - name: Check CocoaPods Trunk registry

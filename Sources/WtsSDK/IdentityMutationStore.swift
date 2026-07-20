@@ -15,7 +15,7 @@ struct FileIdentityMutationStore: IdentityMutationStoring {
       for: .applicationSupportDirectory,
       in: .userDomainMask
     ).first!.appendingPathComponent("co.wetus.wts-sdk", isDirectory: true)
-    self.fileURL = fileURL ?? directory.appendingPathComponent("identity-v1.json")
+    self.fileURL = fileURL ?? directory.appendingPathComponent("identity-v2.json")
   }
 
   func load() throws -> [IdentityMutationRequest] {
