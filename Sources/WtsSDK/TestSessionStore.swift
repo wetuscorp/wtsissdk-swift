@@ -16,7 +16,7 @@ struct FileTestSessionStore: TestSessionStoring {
       for: .applicationSupportDirectory,
       in: .userDomainMask
     ).first!.appendingPathComponent("co.wetus.wts-sdk", isDirectory: true)
-    self.fileURL = fileURL ?? directory.appendingPathComponent("sdk-test-session-v1.json")
+    self.fileURL = fileURL ?? directory.appendingPathComponent("sdk-test-session-v2.json")
   }
 
   func load() throws -> PersistedTestSession? {

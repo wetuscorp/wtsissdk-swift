@@ -10,7 +10,7 @@ struct TestSessionMetadata: Encodable, Sendable {
 }
 
 struct TestSessionPairRequest: Encodable, Sendable {
-  let schemaVersion: Int = 1
+  let schemaVersion: Int = 2
   let pairingToken: String?
   let pairingCode: String?
   let metadata: TestSessionMetadata
@@ -48,19 +48,13 @@ struct TestSessionCapabilities: Codable, Sendable {
   let offlineQueue: Bool
 }
 
-struct TestSessionConsent: Codable, Sendable {
-  let analytics: String
-  let profile: Bool?
-  let experience: String?
-}
-
 struct TestSessionHandshakeRequest: Encodable, Sendable {
-  let schemaVersion: Int = 1
+  let schemaVersion: Int = 2
   let participantId: String
   let sessionToken: String
   let metadata: TestSessionMetadata
   let capabilities: TestSessionCapabilities
-  let consent: TestSessionConsent
+  let consent: String
 }
 
 struct TestSessionHandshakeResponse: Codable, Sendable {
@@ -168,7 +162,7 @@ struct TestSessionRevenueDescriptor: Codable, Sendable, Equatable {
 }
 
 struct TestSessionSignalBatchRequest: Encodable, Sendable {
-  let schemaVersion: Int = 1
+  let schemaVersion: Int = 2
   let participantId: String
   let sessionToken: String
   let signals: [TestSessionSignal]
@@ -188,7 +182,7 @@ struct TestSessionSignalBatchResponse: Codable, Sendable {
 }
 
 struct TestSessionResolveRequest: Encodable, Sendable {
-  let schemaVersion: Int = 1
+  let schemaVersion: Int = 2
   let participantId: String
   let sessionToken: String
   let url: String
@@ -220,7 +214,7 @@ struct TestSessionExperienceDecisionRequest: Encodable, Sendable {
     let locale: String
   }
 
-  let schemaVersion: Int = 1
+  let schemaVersion: Int = 2
   let participantId: String
   let sessionToken: String
   let context: Context
@@ -252,10 +246,12 @@ struct TestSessionExperienceDecisionResponse: Codable, Sendable {
   let reason: String?
   let testGrant: TestGrant?
   let decision: Decision?
+  let renderMode: String
+  let queue: String
 }
 
 struct TestSessionLeaveRequest: Encodable, Sendable {
-  let schemaVersion: Int = 1
+  let schemaVersion: Int = 2
   let participantId: String
   let sessionToken: String
 }

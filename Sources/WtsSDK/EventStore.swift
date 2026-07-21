@@ -14,7 +14,7 @@ struct FileEventStore: EventStoring {
     let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
       .first!
       .appendingPathComponent("co.wetus.wts-sdk", isDirectory: true)
-    self.fileURL = fileURL ?? directory.appendingPathComponent("events-v1.json")
+    self.fileURL = fileURL ?? directory.appendingPathComponent("events-v2.json")
     encoder = JSONEncoder.wts
     decoder = JSONDecoder.wts
   }

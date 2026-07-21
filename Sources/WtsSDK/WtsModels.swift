@@ -103,7 +103,8 @@ public struct WtsReportedAttribution: Codable, Sendable, Equatable {
   }
 }
 
-public enum WtsProfileConsent: Sendable, Equatable {
+public enum WtsConsentState: String, Codable, Sendable, Equatable {
+  case pending
   case granted
   case denied
 }
@@ -218,8 +219,8 @@ public struct WtsTestSessionProbeRunResult: Sendable, Equatable {
   public let skipped: [String]
   public let pendingSignals: Int
   /**
-   * An isolated test-only decision. It is intentionally not passed to the
-   * production Experience runtime or rendered automatically.
+   * An isolated test-only decision. It is rendered automatically without
+   * entering the production Experience queue.
    */
   public let experienceDecision: WtsTestSessionExperienceDecision?
 }
@@ -259,15 +260,15 @@ public struct WtsTestSessionExperienceVariant: Sendable, Equatable {
 public struct WtsDeepLink: Sendable, Equatable {
   public let path: String
   public let parameters: [String: WtsValue]
-  public let linkId: String
-  public let attributionId: String
+  public let linkId: String?
+  public let attributionId: String?
   public let isDeferred: Bool
 
   public init(
     path: String,
     parameters: [String: WtsValue],
-    linkId: String,
-    attributionId: String,
+    linkId: String? = nil,
+    attributionId: String? = nil,
     isDeferred: Bool
   ) {
     self.path = path
@@ -305,22 +306,19 @@ public struct WtsOptions: Sendable {
   public var cacheTTL: TimeInterval
   public var logLevel: WtsLogLevel
   public var collectorBaseURL: URL
-  public var experiences: WtsExperienceOptions
 
   public init(
     apiBaseURL: URL = URL(string: "https://api.wts.is/api/v1")!,
     requestTimeout: TimeInterval = 2,
     cacheTTL: TimeInterval = 60,
     logLevel: WtsLogLevel = .off,
-    collectorBaseURL: URL = URL(string: "https://collect.wts.is")!,
-    experiences: WtsExperienceOptions = WtsExperienceOptions()
+    collectorBaseURL: URL = URL(string: "https://collect.wts.is")!
   ) {
     self.apiBaseURL = apiBaseURL
     self.requestTimeout = requestTimeout
     self.cacheTTL = cacheTTL
     self.logLevel = logLevel
     self.collectorBaseURL = collectorBaseURL
-    self.experiences = experiences
   }
 }
 
@@ -337,7 +335,6 @@ public enum WtsSDKError: Error, Sendable, Equatable {
   case invalidProfile(reason: String)
   case invalidTestSessionPairing
   case profileConsentRequired
-  case experienceProfileConsentRequired
   case storage
 
   public var code: String {
@@ -354,7 +351,6 @@ public enum WtsSDKError: Error, Sendable, Equatable {
     case .invalidProfile: "INVALID_PROFILE"
     case .invalidTestSessionPairing: "INVALID_TEST_SESSION_PAIRING"
     case .profileConsentRequired: "PROFILE_CONSENT_REQUIRED"
-    case .experienceProfileConsentRequired: "EXPERIENCE_PROFILE_CONSENT_REQUIRED"
     case .storage: "STORAGE_ERROR"
     }
   }
@@ -385,7 +381,6 @@ extension WtsSDKError: LocalizedError {
     case .invalidProfile(let reason): reason
     case .invalidTestSessionPairing: "The SDK Test & Validate pairing credential is invalid."
     case .profileConsentRequired: "Profile consent must be granted before using identity APIs."
-    case .experienceProfileConsentRequired: "Personalized Experiences require profile consent."
     case .storage: "The wts.is local event queue could not be persisted."
     }
   }

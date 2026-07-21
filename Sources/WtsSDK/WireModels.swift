@@ -27,6 +27,19 @@ struct ResolveRequest: Codable, Sendable {
   let url: String
 }
 
+struct FunctionalResolveRequest: Encodable, Sendable {
+  let schemaVersion = 4
+  let url: String
+  let platform = "ios"
+}
+
+struct FunctionalResolveResponse: Codable, Sendable {
+  let matched: Bool
+  let destination: URL?
+  let path: String?
+  let parameters: [String: WtsValue]
+}
+
 struct ResolveResponse: Codable, Sendable {
   struct Link: Codable, Sendable {
     let id: String
@@ -58,7 +71,7 @@ struct EventRequest: Codable, Sendable, Equatable {
   }
 
   init(
-    schemaVersion: Int = 3,
+    schemaVersion: Int = 4,
     clientEventId: String = UUID().uuidString.lowercased(),
     installId: String,
     sessionId: String?,
@@ -87,7 +100,7 @@ struct EventRequest: Codable, Sendable, Equatable {
 
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
-    schemaVersion = 3
+    schemaVersion = 4
     clientEventId = try container.decode(String.self, forKey: .clientEventId)
     installId = try container.decode(String.self, forKey: .installId)
     sessionId = try container.decodeIfPresent(String.self, forKey: .sessionId)

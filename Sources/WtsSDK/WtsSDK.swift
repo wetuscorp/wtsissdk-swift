@@ -6,7 +6,7 @@ import Foundation
 
 public actor WtsSDK {
   public static let shared = WtsSDK()
-  public static let version = "0.4.0-alpha.1"
+  public static let version = "0.5.0-alpha.1"
 
   private let transport: HTTPTransport
   private let identity: InstallIdentityProviding
@@ -15,6 +15,10 @@ public actor WtsSDK {
   private let identityBindingStore: IdentityBindingStoring
   private let experienceInteractionStore: ExperienceInteractionStoring
   private let testSessionStore: TestSessionStoring
+  private let consentStore: ConsentStoring
+  private let legacyStateCleaner: LegacyStateCleaning
+  private let experienceManifestCacheStore: ExperienceManifestCacheStoring
+  private let experienceRootPublicKey: String
   private let experienceClock: @Sendable () -> Date
   private let encoder = JSONEncoder.wts
   private let decoder = JSONDecoder.wts
@@ -23,20 +27,18 @@ public actor WtsSDK {
   private var cache = ResolveCache()
   private var retryAttempt = 0
   private var retryTask: Task<Void, Never>?
-  private var profileConsentGranted = false
   private var identityBound = false
   private var identitySessionId = UUID().uuidString.lowercased()
-  private var experienceConsent: WtsExperienceConsent = .pending
+  private var consentState: WtsConsentState = .pending
+  private var experienceDecisionMode: String?
   private var experienceManifest: ExperienceBootstrapResponse.Manifest?
   private var experienceCandidateVersionIds: [String] = []
   private var experienceManifestExpiresAt: Date?
   private var experienceManifestRefreshAt: Date?
   private var experienceQueue: [WtsExperience] = []
   private var experienceGrants: [String: String] = [:]
-  private var manualExperienceStates: [String: ManualExperienceState] = [:]
-  private var offeredManualExperienceId: String?
-  private var experienceHandler: (@Sendable (WtsExperienceManualPresentation) -> Void)?
-  private var experienceActionHandler: (@Sendable (WtsExperience, WtsExperienceAction) -> Bool)?
+  private var experienceActionHandler:
+    (@Sendable (WtsExperience, WtsExperienceAction) async -> Bool)?
   private var experienceLastErrorCode: String?
   private var presentingExperience: WtsExperience?
   private var experienceSessionOverlayPresentations = 0
@@ -47,13 +49,13 @@ public actor WtsSDK {
   private var testSessionLastErrorCode: String?
   private var testSessionRetryTask: Task<Void, Never>?
   private var testSessionRetryAttempt = 0
+  private var experienceRefreshTimer: Task<Void, Never>?
+  private var experienceRefreshTask: Task<ExperienceManifestRefreshResult, Error>?
+  private var experienceManifestETag: String?
 
-  private struct ManualExperienceState: Sendable {
-    let experience: WtsExperience
-    var renderAcknowledged = false
-    var impressionAcknowledged = false
-    var actionIds = Set<String>()
-    var terminalReason: WtsExperienceDismissReason?
+  private enum ExperienceManifestRefreshResult: Sendable {
+    case notModified
+    case response(Data, String?)
   }
 
   private static let maximumExperienceSessionOverlayPresentations = 2
@@ -68,6 +70,10 @@ public actor WtsSDK {
     identityBindingStore = FileIdentityBindingStore()
     experienceInteractionStore = FileExperienceInteractionStore()
     testSessionStore = FileTestSessionStore()
+    consentStore = KeychainConsentStore()
+    legacyStateCleaner = FileLegacyStateCleaner()
+    experienceManifestCacheStore = FileExperienceManifestCacheStore()
+    experienceRootPublicKey = ExperienceTrust.rootPublicKey
     experienceClock = { Date() }
   }
 
@@ -80,6 +86,11 @@ public actor WtsSDK {
     experienceInteractionStore: ExperienceInteractionStoring =
       FileExperienceInteractionStore(),
     testSessionStore: TestSessionStoring = FileTestSessionStore(),
+    consentStore: ConsentStoring = KeychainConsentStore(),
+    legacyStateCleaner: LegacyStateCleaning = FileLegacyStateCleaner(),
+    experienceManifestCacheStore: ExperienceManifestCacheStoring =
+      FileExperienceManifestCacheStore(),
+    experienceRootPublicKey: String = ExperienceTrust.rootPublicKey,
     experienceClock: @escaping @Sendable () -> Date = { Date() }
   ) {
     self.transport = transport
@@ -89,6 +100,10 @@ public actor WtsSDK {
     self.identityBindingStore = identityBindingStore
     self.experienceInteractionStore = experienceInteractionStore
     self.testSessionStore = testSessionStore
+    self.consentStore = consentStore
+    self.legacyStateCleaner = legacyStateCleaner
+    self.experienceManifestCacheStore = experienceManifestCacheStore
+    self.experienceRootPublicKey = experienceRootPublicKey
     self.experienceClock = experienceClock
   }
 
@@ -100,24 +115,46 @@ public actor WtsSDK {
     }
     self.appKey = normalized
     self.options = options
-    identityBound = (try? identityBindingStore.load())?.sourceKey == normalized
     cache.removeAll()
-    if let restored = try? testSessionStore.load(),
-      restored.sourceKey == normalized,
-      testSessionExpiry(restored.expiresAt) > Date()
-    {
-      testSession = restored
-      if restored.compatible, !restored.pendingSignals.isEmpty {
-        Task { [weak self] in try? await self?.flushTestSessionSignals() }
+    try legacyStateCleaner.clear()
+    consentState = try consentStore.load(sourceKey: normalized)
+    if consentState == .granted {
+      restoreExperienceManifestCache(sourceKey: normalized)
+      identityBound = (try? identityBindingStore.load())?.sourceKey == normalized
+      if let restored = try? testSessionStore.load(),
+        restored.sourceKey == normalized,
+        testSessionExpiry(restored.expiresAt) > Date()
+      {
+        testSession = restored
+        if restored.compatible, !restored.pendingSignals.isEmpty {
+          Task { [weak self] in try? await self?.flushTestSessionSignals() }
+        }
+      } else {
+        clearTestSession()
       }
-    } else {
-      clearTestSession()
+      scheduleFlush(after: 0)
+      startExperienceRefreshTimer()
+      Task { [weak self] in try? await self?.refreshExperienceManifest() }
     }
-    scheduleFlush(after: 0)
   }
 
   public func handle(url: URL) async throws -> WtsDeepLink {
     let sourceURL = try unwrap(url)
+    guard consentState == .granted else {
+      let response: FunctionalResolveResponse = try await post(
+        path: "sdk/v4/functional-resolve",
+        body: FunctionalResolveRequest(url: sourceURL.absoluteString),
+        fallbackURL: sourceURL
+      )
+      guard response.matched, let path = response.path, path.hasPrefix("/") else {
+        throw WtsSDKError.noMatch(fallbackURL: response.destination ?? sourceURL)
+      }
+      return WtsDeepLink(
+        path: path,
+        parameters: response.parameters,
+        isDeferred: false
+      )
+    }
     let cacheKey = sourceURL.absoluteString
     if let cached = cache.value(for: cacheKey, now: Date()) {
       recordTestSessionSignal(
@@ -130,7 +167,7 @@ public actor WtsSDK {
       return cached
     }
     let request = ResolveRequest(
-      schemaVersion: 3,
+      schemaVersion: 4,
       clientEventId: UUID().uuidString.lowercased(),
       installId: try identity.value(),
       occurredAt: Date(),
@@ -138,7 +175,7 @@ public actor WtsSDK {
       url: cacheKey
     )
     let response: ResolveResponse = try await post(
-      path: "sdk/v3/resolve",
+      path: "sdk/v4/resolve",
       body: request,
       fallbackURL: sourceURL
     )
@@ -164,30 +201,53 @@ public actor WtsSDK {
   }
 
   public func getDeferredDeepLink() async -> WtsDeepLink? {
-    // iOS does not expose a deterministic install-referrer API in V1.
-    nil
+    guard consentState == .granted else { return nil }
+    // iOS does not expose a deterministic install-referrer API.
+    return nil
   }
 
-  public func setProfileConsent(_ consent: WtsProfileConsent) throws {
-    recordTestSessionSignal(type: "consent", outcome: "observed", feature: "profile")
-    if consent == .granted {
-      profileConsentGranted = true
-      return
+  public func setConsent(_ consent: WtsConsentState) async throws {
+    let sourceKey = try configuredAppKey()
+    guard consent != .pending else {
+      throw WtsSDKError.invalidProfile(reason: "setConsent accepts only granted or denied.")
     }
-    profileConsentGranted = false
-    try setIdentityBound(false)
-    if experienceConsent == .personalized {
-      experienceConsent = .pending
+    try consentStore.save(consent, sourceKey: sourceKey)
+    consentState = consent
+    recordTestSessionSignal(type: "consent", outcome: "observed", feature: "consent")
+    if consent == .denied {
+      experienceRefreshTimer?.cancel()
+      experienceRefreshTimer = nil
+      retryTask?.cancel()
+      retryTask = nil
+      testSessionRetryTask?.cancel()
+      testSessionRetryTask = nil
+      try store.save([])
+      try identityStore.save([])
+      try identityBindingStore.clear()
+      try identity.clear()
+      clearTestSession()
       try clearExperienceRuntime(clearInteractionQueue: true)
-    }
-    try identityStore.save([])
-    guard appKey != nil else {
+      try experienceManifestCacheStore.clear()
+      identityBound = false
       identitySessionId = UUID().uuidString.lowercased()
+      cache.removeAll()
       return
     }
-    try enqueueIdentity(type: "reset_identity")
-    identitySessionId = UUID().uuidString.lowercased()
+    identityBound = (try? identityBindingStore.load())?.sourceKey == sourceKey
+    if let restored = try? testSessionStore.load(),
+      restored.sourceKey == sourceKey,
+      testSessionExpiry(restored.expiresAt) > Date()
+    {
+      testSession = restored
+    }
+    scheduleFlush(after: 0)
+    startExperienceRefreshTimer()
+    do { try await refreshExperienceManifest() } catch {
+      experienceLastErrorCode = "EXPERIENCE_MANIFEST_UNAVAILABLE"
+    }
   }
+
+  public func getConsentState() -> WtsConsentState { consentState }
 
   public func identify(
     _ externalUserId: String,
@@ -244,6 +304,7 @@ public actor WtsSDK {
     linkId: String? = nil
   ) async throws {
     guard appKey != nil else { throw WtsSDKError.notConfigured }
+    guard consentState == .granted else { return }
     try validate(eventKey: eventKey, properties: properties, revenue: revenue)
     var queue = try store.load()
     queue.append(
@@ -271,8 +332,7 @@ public actor WtsSDK {
       feature: "events"
     )
     scheduleFlush(after: 0)
-    await evaluateExperiences(
-      context: ExperienceContextWire(
+    let context = ExperienceContextWire(
         trigger: .init(
           type: "custom_event",
           match: nil,
@@ -285,7 +345,7 @@ public actor WtsSDK {
         properties: properties,
         triggerEventId: queue.last?.clientEventId
       )
-    )
+    Task { [weak self] in await self?.evaluateExperiences(context: context) }
   }
 
   public func screen(
@@ -293,6 +353,7 @@ public actor WtsSDK {
     properties: [String: WtsValue] = [:]
   ) async throws {
     guard appKey != nil else { throw WtsSDKError.notConfigured }
+    guard consentState == .granted else { return }
     let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !normalized.isEmpty, normalized.count <= 120 else {
       throw WtsSDKError.invalidEvent(reason: "Screen name must contain 1 to 120 characters.")
@@ -321,8 +382,7 @@ public actor WtsSDK {
       feature: "screen"
     )
     scheduleFlush(after: 0)
-    await evaluateExperiences(
-      context: ExperienceContextWire(
+    let context = ExperienceContextWire(
         trigger: .init(
           type: "screen_view",
           match: nil,
@@ -335,58 +395,17 @@ public actor WtsSDK {
         properties: properties,
         triggerEventId: queue.last?.clientEventId
       )
-    )
-  }
-
-  public func setExperienceConsent(_ consent: WtsExperienceConsent) async throws
-    -> WtsExperienceResult
-  {
-    guard options.experiences.enabled else { return .featureDisabled }
-    if consent == .personalized, !profileConsentGranted {
-      throw WtsSDKError.experienceProfileConsentRequired
-    }
-    experienceConsent = consent
-    recordTestSessionSignal(type: "consent", outcome: "observed", feature: "experiences")
-    if consent == .pending || consent == .denied {
-      try clearExperienceRuntime(clearInteractionQueue: true)
-      return .accepted
-    }
-    guard !options.experiences.manifestVerificationKeys.isEmpty else {
-      try clearExperienceRuntime(clearInteractionQueue: false)
-      experienceLastErrorCode = "EXPERIENCE_MANIFEST_VERIFICATION_FAILED"
-      return .manifestVerificationFailed
-    }
-    do {
-      try await refreshExperienceManifest()
-    } catch let error as WtsSDKError {
-      guard case .invalidResponse = error else { throw error }
-      try clearExperienceRuntime(clearInteractionQueue: false)
-      experienceLastErrorCode = "EXPERIENCE_MANIFEST_VERIFICATION_FAILED"
-      return .manifestVerificationFailed
-    }
-    do {
-      try await flushExperienceInteractions()
-    } catch {
-      scheduleRetry()
-    }
-    return .accepted
-  }
-
-  public func onExperienceAvailable(
-    _ handler: (@Sendable (WtsExperienceManualPresentation) -> Void)?
-  ) {
-    experienceHandler = handler
-    notifyNextManualExperienceIfAvailable()
+    Task { [weak self] in await self?.evaluateExperiences(context: context) }
   }
 
   public func onExperienceAction(
-    _ handler: (@Sendable (WtsExperience, WtsExperienceAction) -> Bool)?
+    _ handler: (@Sendable (WtsExperience, WtsExperienceAction) async -> Bool)?
   ) {
     experienceActionHandler = handler
   }
 
-  public func presentNextExperience() async -> WtsExperience? {
-    guard options.experiences.renderMode == .automatic else { return nil }
+  private func presentNextExperience() async -> WtsExperience? {
+    guard consentState == .granted else { return nil }
     guard experiencePresentationAdmissionFailureCode() == nil,
       presentingExperience == nil,
       !experienceQueue.isEmpty
@@ -397,7 +416,6 @@ public actor WtsSDK {
   }
 
   public func dismissCurrentExperience() {
-    guard options.experiences.renderMode == .automatic else { return }
     guard presentingExperience != nil else { return }
     #if canImport(UIKit)
       Task { @MainActor in WtsExperiencePresenter.dismissCurrent() }
@@ -406,150 +424,11 @@ public actor WtsSDK {
     #endif
   }
 
-  /// Acknowledges that the host has begun rendering a manual Experience.
-  public func acknowledgeExperienceRender(
-    _ handle: WtsExperiencePresentationHandle
-  ) async -> WtsExperienceLifecycleOutcome {
-    guard isManualExperienceRuntimeEnabled else {
-      return manualExperienceUnavailableOutcome
-    }
-    if let code = experiencePresentationAdmissionFailureCode() {
-      return .init(accepted: false, code: code)
-    }
-    guard var state = manualExperienceStates[handle.exposureId] else {
-      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_FOUND")
-    }
-    if state.renderAcknowledged {
-      return .init(accepted: true, idempotent: true)
-    }
-    guard state.terminalReason == nil,
-      presentingExperience == nil,
-      experienceQueue.first?.exposureId == handle.exposureId
-    else {
-      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_CURRENT")
-    }
-    experienceQueue.removeFirst()
-    offeredManualExperienceId = nil
-    state.renderAcknowledged = true
-    manualExperienceStates[handle.exposureId] = state
-    presentingExperience = state.experience
-    experienceSessionOverlayPresentations += 1
-    await recordExperience(state.experience, type: "render_started")
-    await recordExperience(state.experience, type: "render_succeeded")
-    return .init(accepted: true)
-  }
-
-  /// Records a visibility-qualified impression for a manual Experience.
-  public func acknowledgeExperienceImpression(
-    _ handle: WtsExperiencePresentationHandle
-  ) async -> WtsExperienceLifecycleOutcome {
-    guard isManualExperienceRuntimeEnabled else {
-      return manualExperienceUnavailableOutcome
-    }
-    guard var state = manualExperienceStates[handle.exposureId] else {
-      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_FOUND")
-    }
-    if state.impressionAcknowledged {
-      return .init(accepted: true, idempotent: true)
-    }
-    guard state.renderAcknowledged,
-      presentingExperience?.exposureId == handle.exposureId,
-      state.terminalReason == nil
-    else {
-      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_CURRENT")
-    }
-    guard experienceSessionImpressions < Self.maximumExperienceSessionImpressions else {
-      return .init(accepted: false, code: "EXPERIENCE_SESSION_CAP_REACHED")
-    }
-    state.impressionAcknowledged = true
-    manualExperienceStates[handle.exposureId] = state
-    experienceSessionImpressions += 1
-    await recordExperience(state.experience, type: "impression")
-    return .init(accepted: true)
-  }
-
-  /// Records a validated host-handled action for a manual Experience.
-  public func reportExperienceAction(
-    _ handle: WtsExperiencePresentationHandle,
-    actionId: String
-  ) async -> WtsExperienceLifecycleOutcome {
-    guard isManualExperienceRuntimeEnabled else {
-      return manualExperienceUnavailableOutcome
-    }
-    guard var state = manualExperienceStates[handle.exposureId] else {
-      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_FOUND")
-    }
-    guard state.renderAcknowledged,
-      presentingExperience?.exposureId == handle.exposureId,
-      state.terminalReason == nil
-    else {
-      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_CURRENT")
-    }
-    if state.actionIds.contains(actionId) {
-      return .init(accepted: true, idempotent: true)
-    }
-    guard let action = experienceAction(state.experience, id: actionId) else {
-      return .init(accepted: false, code: "EXPERIENCE_ACTION_INVALID")
-    }
-    guard isExperienceActionAllowed(action) else {
-      experienceLastErrorCode = "EXPERIENCE_ACTION_NOT_ALLOWED"
-      return .init(accepted: false, code: "EXPERIENCE_ACTION_NOT_ALLOWED")
-    }
-    state.actionIds.insert(action.id)
-    manualExperienceStates[handle.exposureId] = state
-    await recordExperience(
-      state.experience,
-      type: isPrimaryExperienceAction(state.experience, id: action.id)
-        ? "primary_action" : "secondary_action",
-      actionId: action.id
-    )
-    if action.isNavigationAction { clearQueuedExperiences() }
-    return .init(accepted: true)
-  }
-
-  /// Terminates a manual Experience presentation. Render failures require a
-  /// stable failure code so they remain diagnosable without leaking host data.
-  public func dismissExperience(
-    _ handle: WtsExperiencePresentationHandle,
-    reason: WtsExperienceDismissReason = .dismissed,
-    failureCode: String? = nil
-  ) async -> WtsExperienceLifecycleOutcome {
-    guard isManualExperienceRuntimeEnabled else {
-      return manualExperienceUnavailableOutcome
-    }
-    guard var state = manualExperienceStates[handle.exposureId] else {
-      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_FOUND")
-    }
-    if state.terminalReason == reason {
-      return .init(accepted: true, idempotent: true)
-    }
-    guard state.renderAcknowledged,
-      presentingExperience?.exposureId == handle.exposureId,
-      state.terminalReason == nil
-    else {
-      return .init(accepted: false, code: "EXPERIENCE_PRESENTATION_NOT_CURRENT")
-    }
-    guard reason != .renderFailed || !(failureCode?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) else {
-      return .init(accepted: false, code: "EXPERIENCE_FAILURE_CODE_REQUIRED")
-    }
-    state.terminalReason = reason
-    manualExperienceStates[handle.exposureId] = state
-    presentingExperience = nil
-    await recordExperience(
-      state.experience,
-      type: experienceTerminalInteractionType(reason),
-      failureCode: reason == .renderFailed ? failureCode : nil
-    )
-    experiencePresentationCooldownUntil = experienceClock()
-      .addingTimeInterval(Self.experiencePresentationCooldown)
-    scheduleNextManualExperienceAfterCooldown()
-    return .init(accepted: true)
-  }
-
   public func getExperienceDiagnostics() -> WtsExperienceDiagnostics {
     WtsExperienceDiagnostics(
-      enabled: options.experiences.enabled,
-      consent: experienceConsent,
+      enabled: consentState == .granted,
+      consent: consentState,
+      decisionMode: experienceDecisionMode,
       queued: experienceQueue.count,
       presenting: presentingExperience != nil,
       testDeviceToken: experienceTestDeviceToken,
@@ -585,13 +464,15 @@ public actor WtsSDK {
   }
 
   private func clearExperienceRuntime(clearInteractionQueue: Bool) throws {
+    experienceRefreshTask?.cancel()
+    experienceRefreshTask = nil
     experienceManifest = nil
     experienceCandidateVersionIds = []
     experienceManifestExpiresAt = nil
     experienceManifestRefreshAt = nil
+    experienceManifestETag = nil
     experienceGrants = [:]
     clearQueuedExperiences()
-    manualExperienceStates.removeAll()
     presentingExperience = nil
     experiencePresentationCooldownUntil = nil
     #if canImport(UIKit)
@@ -604,55 +485,9 @@ public actor WtsSDK {
 
   private func clearQueuedExperiences() {
     for experience in experienceQueue {
-      manualExperienceStates.removeValue(forKey: experience.exposureId)
       experienceGrants.removeValue(forKey: experience.assignmentId)
     }
     experienceQueue = []
-    offeredManualExperienceId = nil
-  }
-
-  private var isManualExperienceRuntimeEnabled: Bool {
-    options.experiences.enabled
-      && options.experiences.renderMode == .manual
-      && (experienceConsent == .contextual || experienceConsent == .personalized)
-      && (experienceConsent != .personalized || profileConsentGranted)
-  }
-
-  private var manualExperienceUnavailableOutcome: WtsExperienceLifecycleOutcome {
-    if !options.experiences.enabled {
-      return .init(accepted: false, code: "EXPERIENCE_FEATURE_DISABLED")
-    }
-    if options.experiences.renderMode != .manual {
-      return .init(accepted: false, code: "EXPERIENCE_MANUAL_MODE_REQUIRED")
-    }
-    if experienceConsent == .personalized, !profileConsentGranted {
-      return .init(accepted: false, code: "EXPERIENCE_PROFILE_CONSENT_REQUIRED")
-    }
-    return .init(accepted: false, code: "EXPERIENCE_CONSENT_REQUIRED")
-  }
-
-  private func notifyNextManualExperienceIfAvailable() {
-    guard isManualExperienceRuntimeEnabled,
-      experiencePresentationAdmissionFailureCode() == nil,
-      presentingExperience == nil,
-      let handler = experienceHandler,
-      let next = experienceQueue.first,
-      offeredManualExperienceId != next.exposureId
-    else { return }
-    offeredManualExperienceId = next.exposureId
-    handler(
-      WtsExperienceManualPresentation(
-        experience: next,
-        handle: WtsExperiencePresentationHandle(exposureId: next.exposureId)
-      )
-    )
-  }
-
-  private func scheduleNextManualExperienceAfterCooldown() {
-    Task { [weak self] in
-      try? await Task.sleep(nanoseconds: 3_000_000_000)
-      await self?.notifyNextManualExperienceIfAvailable()
-    }
   }
 
   /**
@@ -663,6 +498,19 @@ public actor WtsSDK {
     _ pairing: WtsTestSessionPairing,
     sdkFamily: WtsTestSessionSDKFamily = .nativeSwift
   ) async -> WtsTestSessionJoinResult {
+    guard consentState == .granted else {
+      return WtsTestSessionJoinResult(
+        accepted: false,
+        joined: false,
+        compatible: false,
+        requiredSDKVersion: nil,
+        checks: [],
+        sessionId: nil,
+        expiresAt: nil,
+        testProfileExternalUserId: nil,
+        errorCode: "CONSENT_REQUIRED"
+      )
+    }
     do {
       let pair: TestSessionPairResponse = try await postTest(
         path: "pair",
@@ -876,7 +724,7 @@ public actor WtsSDK {
       skipped.append("screen")
     }
     var experienceDecision: WtsTestSessionExperienceDecision?
-    if options.experiences.enabled,
+    if consentState == .granted,
       let experience = active.testPlan.experience,
       experience.selected, experience.available
     {
@@ -885,6 +733,7 @@ public actor WtsSDK {
       if response?.outcome == "ready" {
         testSession = active.withTestExperienceDecisionReady()
         persistTestSession()
+        if let response { await presentTestSessionExperience(response) }
         emitted.append("experiences")
       } else {
         skipped.append("experiences")
@@ -923,7 +772,7 @@ public actor WtsSDK {
   }
 
   public func flush() async {
-    guard appKey != nil else { return }
+    guard appKey != nil, consentState == .granted else { return }
     do {
       try await flushIdentity()
       do {
@@ -939,13 +788,13 @@ public actor WtsSDK {
       }
       var batch = Array(queue.prefix(50))
       while batch.count > 1
-        && encodedSize(EventBatchRequest(schemaVersion: 3, events: batch)) > 65_536
+        && encodedSize(EventBatchRequest(schemaVersion: 4, events: batch)) > 65_536
       {
         batch.removeLast()
       }
       let response: EventBatchResponse = try await post(
-        path: "sdk/v3/events/batch",
-        body: EventBatchRequest(schemaVersion: 3, events: batch),
+        path: "sdk/v4/events/batch",
+        body: EventBatchRequest(schemaVersion: 4, events: batch),
         fallbackURL: nil
       )
       let terminal = Set(
@@ -1017,10 +866,6 @@ public actor WtsSDK {
   private func configuredAppKey() throws -> String {
     guard let appKey else { throw WtsSDKError.notConfigured }
     return appKey
-  }
-
-  private var effectiveExperienceConsent: WtsExperienceConsent {
-    experienceConsent == .personalized && !identityBound ? .contextual : experienceConsent
   }
 
   private func updateIdentityBinding(
@@ -1259,6 +1104,27 @@ public actor WtsSDK {
     testSessionRetryTask = nil
   }
 
+  private func startExperienceRefreshTimer() {
+    experienceRefreshTimer?.cancel()
+    experienceRefreshTimer = Task { [weak self] in
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: 60_000_000_000)
+        guard !Task.isCancelled else { return }
+        await self?.refreshExperienceManifestFromTimer()
+      }
+    }
+  }
+
+  private func refreshExperienceManifestFromTimer() async {
+    guard consentState == .granted else { return }
+    do { try await refreshExperienceManifest() } catch {
+      if let expiresAt = experienceManifestExpiresAt, expiresAt <= experienceClock() {
+        try? clearExperienceRuntime(clearInteractionQueue: false)
+        experienceLastErrorCode = "EXPERIENCE_MANIFEST_EXPIRED"
+      }
+    }
+  }
+
   private func runTestSessionExperienceProbe(
     _ active: PersistedTestSession
   ) async -> TestSessionExperienceDecisionResponse? {
@@ -1286,11 +1152,51 @@ public actor WtsSDK {
     }
   }
 
+  private func presentTestSessionExperience(
+    _ response: TestSessionExperienceDecisionResponse
+  ) async {
+    guard response.renderMode == "automatic", response.queue == "isolated_test",
+      let decision = response.decision,
+      let variant = decision.variant,
+      let placement = WtsExperiencePlacement(rawValue: decision.placement),
+      let contentData = try? encoder.encode(variant.content),
+      let content = try? decoder.decode(WtsExperienceContent.self, from: contentData)
+    else { return }
+    let experience = WtsExperience(
+      campaignId: decision.campaignId,
+      campaignVersionId: decision.campaignVersionId,
+      assignmentId: "test-session",
+      variantId: variant.id,
+      exposureId: UUID().uuidString.lowercased(),
+      placement: placement,
+      priority: Int.max,
+      content: content,
+      assetURL: variant.asset?.url
+    )
+    #if canImport(UIKit)
+      _ = await WtsExperiencePresenter.present(
+        experience,
+        onImpression: { [weak self] in
+          Task {
+            await self?.recordTestSessionSignal(
+              type: "experience_impression", outcome: "observed", feature: "experiences")
+          }
+        },
+        onAction: { [weak self] _ in
+          await self?.recordTestSessionSignal(
+            type: "experience_action", outcome: "observed", feature: "experiences")
+          return true
+        },
+        onDismiss: { _ in }
+      )
+    #endif
+  }
+
   private func postTest<Request: Encodable, Response: Decodable>(
     path: String,
     body: Request
   ) async throws -> Response {
-    try await post(path: "sdk/test/v1/\(path)", body: body, fallbackURL: nil)
+    try await post(path: "sdk/test/v2/\(path)", body: body, fallbackURL: nil)
   }
 
   private func testSessionMetadata(_ sdkFamily: WtsTestSessionSDKFamily) -> TestSessionMetadata {
@@ -1308,18 +1214,12 @@ public actor WtsSDK {
       deeplink: true,
       identity: true,
       screen: true,
-      experiences: options.experiences.enabled,
+      experiences: true,
       offlineQueue: true
     )
   }
 
-  private var testSessionConsent: TestSessionConsent {
-    TestSessionConsent(
-      analytics: "granted",
-      profile: profileConsentGranted,
-      experience: experienceConsent.rawValue
-    )
-  }
+  private var testSessionConsent: String { consentState.rawValue }
 
   private func testSessionExpiry(_ value: String) -> Date {
     let formatter = ISO8601DateFormatter()
@@ -1368,27 +1268,72 @@ public actor WtsSDK {
 
   private func refreshExperienceManifest() async throws {
     guard let appKey else { throw WtsSDKError.notConfigured }
-    guard experienceConsent != .personalized || profileConsentGranted else {
-      throw WtsSDKError.experienceProfileConsentRequired
-    }
-    let deliveryConsent = effectiveExperienceConsent
-    let response: ExperienceBootstrapResponse = try await postExperience(
-      path: "experiences/v1/bootstrap",
-      sourceKey: appKey,
-      body: ExperienceBootstrapRequest(
-        consent: deliveryConsent,
-        profileConsentGranted: profileConsentGranted,
-        actorId: try identity.value(),
-        sessionId: identitySessionId,
-        metadata: .current,
-        settings: experienceSettings,
-        testDeviceToken: experienceTestDeviceToken
+    guard consentState == .granted else { return }
+    let task: Task<ExperienceManifestRefreshResult, Error>
+    if let current = experienceRefreshTask {
+      task = current
+    } else {
+      var request = URLRequest(
+        url: options.collectorBaseURL.appendingPathComponent("experiences/v2/bootstrap"),
+        timeoutInterval: options.requestTimeout
       )
-    )
+      request.httpMethod = "POST"
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      request.setValue(appKey, forHTTPHeaderField: "X-WTS-Source-Key")
+      if let experienceManifestETag {
+        request.setValue(experienceManifestETag, forHTTPHeaderField: "If-None-Match")
+      }
+      request.httpBody = try encoder.encode(
+        ExperienceBootstrapRequest(
+          actorId: try identity.value(),
+          sessionId: identitySessionId,
+          metadata: .current,
+          testDeviceToken: experienceTestDeviceToken
+        )
+      )
+      let transport = self.transport
+      task = Task {
+        let (data, response) = try await transport.data(for: request)
+        if response.statusCode == 304 { return .notModified }
+        guard (200..<300).contains(response.statusCode) else {
+          throw WtsSDKError.server(statusCode: response.statusCode, fallbackURL: nil)
+        }
+        return .response(data, response.value(forHTTPHeaderField: "ETag"))
+      }
+      experienceRefreshTask = task
+    }
+    let result: ExperienceManifestRefreshResult
+    do {
+      result = try await task.value
+    } catch let error as WtsSDKError {
+      experienceRefreshTask = nil
+      throw error
+    } catch let error as URLError where error.code == .timedOut {
+      experienceRefreshTask = nil
+      throw WtsSDKError.timeout(fallbackURL: nil)
+    } catch {
+      experienceRefreshTask = nil
+      throw WtsSDKError.network(fallbackURL: nil)
+    }
+    experienceRefreshTask = nil
+    if case .notModified = result {
+      guard let expiresAt = experienceManifestExpiresAt, expiresAt > experienceClock() else {
+        throw WtsSDKError.invalidResponse(fallbackURL: nil)
+      }
+      experienceManifestRefreshAt = min(
+        expiresAt,
+        experienceClock().addingTimeInterval(60)
+      )
+      return
+    }
+    guard case .response(let data, let etag) = result,
+      let response = try? decoder.decode(ExperienceBootstrapResponse.self, from: data)
+    else { throw WtsSDKError.invalidResponse(fallbackURL: nil) }
     guard let manifest = ExperienceManifestVerifier.verify(
       response: response,
-      verificationKeys: options.experiences.manifestVerificationKeys,
+      rootPublicKey: experienceRootPublicKey,
       expectedSourceKey: appKey,
+      now: experienceClock(),
       decoder: decoder
     ), manifest.expiresAt > experienceClock() else {
       throw WtsSDKError.invalidResponse(fallbackURL: nil)
@@ -1398,50 +1343,80 @@ public actor WtsSDK {
     experienceManifestExpiresAt = manifest.expiresAt
     experienceManifestRefreshAt = min(
       manifest.expiresAt,
-      experienceClock().addingTimeInterval(5 * 60)
+      experienceClock().addingTimeInterval(60)
+    )
+    experienceManifestETag = etag
+    try experienceManifestCacheStore.save(
+      CachedExperienceManifestEnvelope(sourceKey: appKey, etag: etag, responseData: data)
     )
     experienceLastErrorCode = nil
   }
 
+  private func restoreExperienceManifestCache(sourceKey: String) {
+    guard let cached = try? experienceManifestCacheStore.load(),
+      cached.sourceKey == sourceKey,
+      let response = try? decoder.decode(
+        ExperienceBootstrapResponse.self,
+        from: cached.responseData
+      ),
+      let manifest = ExperienceManifestVerifier.verify(
+        response: response,
+        rootPublicKey: experienceRootPublicKey,
+        expectedSourceKey: sourceKey,
+        now: experienceClock(),
+        decoder: decoder
+      )
+    else {
+      try? experienceManifestCacheStore.clear()
+      return
+    }
+    experienceManifest = manifest
+    experienceCandidateVersionIds = manifest.campaigns.map(\.campaignVersionId)
+    experienceManifestExpiresAt = manifest.expiresAt
+    experienceManifestRefreshAt = experienceClock()
+    experienceManifestETag = cached.etag
+  }
+
   private func evaluateExperiences(context: ExperienceContextWire) async {
-    guard options.experiences.enabled,
-      experienceConsent == .contextual || experienceConsent == .personalized,
-      experienceConsent != .personalized || profileConsentGranted
-    else { return }
+    guard consentState == .granted else { return }
     do {
       if experienceManifestRefreshAt == nil || experienceManifestRefreshAt! <= experienceClock() {
-        try await refreshExperienceManifest()
+        do { try await refreshExperienceManifest() } catch {
+          guard let expiresAt = experienceManifestExpiresAt, expiresAt > experienceClock() else {
+            throw error
+          }
+        }
       }
-      if experienceConsent == .personalized, !identityBound {
+      if !identityBound {
         do {
           try await flushIdentity()
         } catch {
           scheduleRetry()
         }
       }
-      let deliveryConsent = effectiveExperienceConsent
+      guard let appKey, !experienceCandidateVersionIds.isEmpty else { return }
       let decisions: [ExperienceDecisionResponse.Decision]
-      if deliveryConsent == .contextual {
-        guard let manifest = experienceManifest else { return }
-        decisions = contextualExperienceDecisions(manifest: manifest, context: context)
-      } else {
-        guard let appKey, !experienceCandidateVersionIds.isEmpty else { return }
+      do {
         let response: ExperienceDecisionResponse = try await postExperience(
-          path: "experiences/v1/decide",
+          path: "experiences/v2/decide",
           sourceKey: appKey,
           body: ExperienceDecisionRequest(
-            consent: deliveryConsent,
-            profileConsentGranted: profileConsentGranted,
             actorId: try identity.value(),
             sessionId: identitySessionId,
             metadata: .current,
-            settings: experienceSettings,
             testDeviceToken: experienceTestDeviceToken,
             candidateVersionIds: experienceCandidateVersionIds,
             context: context
           )
         )
+        experienceDecisionMode = response.mode
         decisions = response.decisions
+      } catch {
+        guard let manifest = experienceManifest,
+          manifest.expiresAt > experienceClock()
+        else { throw error }
+        experienceDecisionMode = "contextual"
+        decisions = contextualExperienceDecisions(manifest: manifest, context: context)
       }
       var interactions: [ExperienceInteractionRequest] = []
       for decision in decisions.prefix(5) {
@@ -1476,9 +1451,6 @@ public actor WtsSDK {
         else { continue }
         experienceGrants[experience.assignmentId] = decision.grant
         experienceQueue.append(experience)
-        if options.experiences.renderMode == .manual {
-          manualExperienceStates[experience.exposureId] = ManualExperienceState(experience: experience)
-        }
         experienceQueue.sort {
           $0.priority == $1.priority
             ? $0.campaignId < $1.campaignId
@@ -1486,7 +1458,6 @@ public actor WtsSDK {
         }
         if experienceQueue.count > 5 {
           let dropped = experienceQueue.removeLast()
-          manualExperienceStates.removeValue(forKey: dropped.exposureId)
           experienceGrants.removeValue(forKey: dropped.assignmentId)
         }
         let survivedQueueCap = experienceQueue.contains {
@@ -1513,11 +1484,7 @@ public actor WtsSDK {
           scheduleRetry()
         }
       }
-      if options.experiences.renderMode == .automatic {
-        _ = await presentNextExperience()
-      } else {
-        notifyNextManualExperienceIfAvailable()
-      }
+      _ = await presentNextExperience()
     } catch let error as WtsSDKError {
       experienceLastErrorCode = error.code
       log(.error, "Experience decision failed (\(error.code)).")
@@ -1586,8 +1553,7 @@ public actor WtsSDK {
   }
 
   private func flushExperienceInteractions() async throws {
-    guard experienceConsent == .contextual || experienceConsent == .personalized,
-      let appKey
+    guard consentState == .granted, let appKey
     else { return }
     let queue = try experienceInteractionStore.load()
     guard !queue.isEmpty else { return }
@@ -1596,8 +1562,6 @@ public actor WtsSDK {
     while batch.count > 1
       && encodedSize(
         ExperienceInteractionBatchRequest(
-          consent: effectiveExperienceConsent,
-          profileConsentGranted: profileConsentGranted,
           actorId: actorId,
           sessionId: identitySessionId,
           interactions: batch
@@ -1608,11 +1572,9 @@ public actor WtsSDK {
     }
     do {
       let response: ExperienceInteractionBatchResponse = try await postExperience(
-        path: "experiences/v1/interactions/batch",
+        path: "experiences/v2/interactions/batch",
         sourceKey: appKey,
         body: ExperienceInteractionBatchRequest(
-          consent: effectiveExperienceConsent,
-          profileConsentGranted: profileConsentGranted,
           actorId: actorId,
           sessionId: identitySessionId,
           interactions: batch
@@ -1647,6 +1609,7 @@ public actor WtsSDK {
     _ experience: WtsExperience,
     type: String,
     actionId: String? = nil,
+    actionOutcome: String? = nil,
     failureCode: String? = nil
   ) async {
     guard let grant = experienceGrants[experience.assignmentId] else { return }
@@ -1660,6 +1623,7 @@ public actor WtsSDK {
       exposureId: experience.exposureId,
       type: type,
       actionId: actionId,
+      actionOutcome: actionOutcome,
       triggerEventId: nil,
       occurredAt: Date(),
       metadata: .current,
@@ -1699,7 +1663,7 @@ public actor WtsSDK {
           Task { await self?.experienceDidImpress(experience) }
         },
         onAction: { [weak self] action in
-          Task { await self?.handleExperienceAction(experience, action: action) }
+          await self?.handleExperienceAction(experience, action: action) ?? false
         },
         onDismiss: { [weak self] reason in
           Task { await self?.experienceDidDismiss(experience, reason: reason) }
@@ -1751,20 +1715,27 @@ public actor WtsSDK {
   private func handleExperienceAction(
     _ experience: WtsExperience,
     action: WtsExperienceAction
-  ) async {
-    guard isExperienceActionAllowed(action) else {
-      experienceLastErrorCode = "EXPERIENCE_ACTION_NOT_ALLOWED"
-      return
+  ) async -> Bool {
+    let handled: Bool
+    if action.type == .openInternalRoute || action.type == .customCallback {
+      if isExperienceActionAllowed(action) {
+        handled = await experienceActionHandler?(experience, action) ?? false
+      } else {
+        handled = false
+      }
+    } else {
+      handled = await performSafeExperienceAction(action)
     }
-    let handled = experienceActionHandler?(experience, action) ?? false
-    if !handled { await performSafeExperienceAction(action) }
+    if !handled { experienceLastErrorCode = "EXPERIENCE_ACTION_UNHANDLED" }
     await recordExperience(
       experience,
       type: isPrimaryExperienceAction(experience, id: action.id)
         ? "primary_action" : "secondary_action",
-      actionId: action.id
+      actionId: action.id,
+      actionOutcome: handled ? "handled" : "unhandled"
     )
-    if action.isNavigationAction { clearQueuedExperiences() }
+    if handled && action.isNavigationAction { clearQueuedExperiences() }
+    return handled
   }
 
   private func isExperienceActionAllowed(_ action: WtsExperienceAction) -> Bool {
@@ -1774,22 +1745,18 @@ public actor WtsSDK {
     case .copyCode:
       return action.target?.isEmpty == false
     case .openInternalRoute:
-      return action.target.map(options.experiences.allowedInternalRoutes.contains) == true
+      return action.target?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     case .customCallback:
-      return action.target.map(options.experiences.allowedCallbackKeys.contains) == true
+      return action.target?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     case .openWebURL:
       guard
         let target = action.target,
         let url = URL(string: target),
         url.scheme?.lowercased() == "https",
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-        let scheme = components.scheme,
-        let host = components.host
+        components.host != nil
       else { return false }
-      let port = components.port.map { ":\($0)" } ?? ""
-      return options.experiences.allowedWebOrigins.contains(
-        "\(scheme)://\(host)\(port)".lowercased()
-      )
+      return true
     case .openDeepLink:
       guard
         let target = action.target,
@@ -1797,55 +1764,48 @@ public actor WtsSDK {
         let scheme = url.scheme?.lowercased()
       else { return false }
       guard !isUnsafeExperienceScheme(scheme) else { return false }
-      if scheme == "https" {
-        return url.host.map {
-          options.experiences.allowedDeepLinkHosts.contains($0.lowercased())
-        } == true
-      }
-      return options.experiences.allowedDeepLinkSchemes.contains(scheme)
+      return scheme == "https" ? url.host != nil : isSafeCustomScheme(scheme)
     }
   }
 
-  private func performSafeExperienceAction(_ action: WtsExperienceAction) async {
-    guard let target = action.target else { return }
+  private func performSafeExperienceAction(_ action: WtsExperienceAction) async -> Bool {
     switch action.type {
-    case .dismiss, .customCallback, .openInternalRoute:
-      return
+    case .dismiss:
+      dismissCurrentExperience()
+      return true
+    case .customCallback, .openInternalRoute:
+      return false
     case .copyCode:
+      guard let target = action.target, !target.isEmpty else { return false }
       #if canImport(UIKit)
         await MainActor.run { UIPasteboard.general.string = target }
       #endif
+      return true
     case .openWebURL:
-      guard let url = URL(string: target), url.scheme == "https",
-        let origin = URLComponents(url: url, resolvingAgainstBaseURL: false)
-          .flatMap({ components -> String? in
-            guard let scheme = components.scheme, let host = components.host else { return nil }
-            let port = components.port.map { ":\($0)" } ?? ""
-            return "\(scheme)://\(host)\(port)".lowercased()
-          }),
-        options.experiences.allowedWebOrigins.contains(origin)
-      else { return }
+      guard let target = action.target,
+        let url = URL(string: target), url.scheme?.lowercased() == "https", url.host != nil
+      else { return false }
       #if canImport(UIKit)
         await MainActor.run { UIApplication.shared.open(url) }
       #endif
+      return true
     case .openDeepLink:
-      guard let url = URL(string: target),
+      guard let target = action.target, let url = URL(string: target),
         let scheme = url.scheme?.lowercased()
-      else { return }
-      guard !isUnsafeExperienceScheme(scheme) else { return }
-      let allowed: Bool
-      if scheme == "https" {
-        allowed = url.host.map {
-          options.experiences.allowedDeepLinkHosts.contains($0.lowercased())
-        } == true
-      } else {
-        allowed = options.experiences.allowedDeepLinkSchemes.contains(scheme)
-      }
-      guard allowed else { return }
+      else { return false }
+      guard !isUnsafeExperienceScheme(scheme),
+        scheme == "https" ? url.host != nil : isSafeCustomScheme(scheme)
+      else { return false }
       #if canImport(UIKit)
         await MainActor.run { UIApplication.shared.open(url) }
       #endif
+      return true
     }
+  }
+
+  private func isSafeCustomScheme(_ scheme: String) -> Bool {
+    scheme.range(of: "^[a-z][a-z0-9+.-]*$", options: .regularExpression) != nil
+      && !isUnsafeExperienceScheme(scheme)
   }
 
   private func isUnsafeExperienceScheme(_ scheme: String) -> Bool {
@@ -1869,6 +1829,7 @@ public actor WtsSDK {
       exposureId: exposureId,
       type: type,
       actionId: nil,
+      actionOutcome: nil,
       triggerEventId: triggerEventId,
       occurredAt: Date(),
       metadata: .current,
@@ -1902,16 +1863,6 @@ public actor WtsSDK {
     } catch {
       throw WtsSDKError.network(fallbackURL: nil)
     }
-  }
-
-  private var experienceSettings: ExperienceSettingsWire {
-    ExperienceSettingsWire(
-      allowedInternalRoutes: options.experiences.allowedInternalRoutes.sorted(),
-      allowedCallbackKeys: options.experiences.allowedCallbackKeys.sorted(),
-      allowedDeepLinkHosts: options.experiences.allowedDeepLinkHosts.sorted(),
-      allowedDeepLinkSchemes: options.experiences.allowedDeepLinkSchemes.sorted(),
-      allowedWebOrigins: options.experiences.allowedWebOrigins.sorted()
-    )
   }
 
   private func unwrap(_ url: URL) throws -> URL {
@@ -2012,7 +1963,7 @@ public actor WtsSDK {
   }
 
   private func requireProfileConsent() throws {
-    guard profileConsentGranted else { throw WtsSDKError.profileConsentRequired }
+    guard consentState == .granted else { throw WtsSDKError.profileConsentRequired }
   }
 
   private func testSessionIdentityMethods(

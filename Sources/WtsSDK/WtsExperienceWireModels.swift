@@ -1,25 +1,30 @@
 import Foundation
 
-struct ExperienceSettingsWire: Encodable {
-  let allowedInternalRoutes: [String]
-  let allowedCallbackKeys: [String]
-  let allowedDeepLinkHosts: [String]
-  let allowedDeepLinkSchemes: [String]
-  let allowedWebOrigins: [String]
-}
-
 struct ExperienceBootstrapRequest: Encodable {
-  let schemaVersion = 1
-  let consent: WtsExperienceConsent
-  let profileConsentGranted: Bool
+  let schemaVersion = 2
   let actorId: String
   let sessionId: String
   let metadata: WtsMetadata
-  let settings: ExperienceSettingsWire
   let testDeviceToken: String
 }
 
 struct ExperienceBootstrapResponse: Decodable {
+  struct OnlineKeyset: Decodable {
+    struct Key: Decodable, Equatable {
+      let keyId: String
+      let algorithm: String
+      let publicKey: String
+      let notBefore: Date
+      let expiresAt: Date
+    }
+    let version: Int
+    let issuedAt: Date
+    let expiresAt: Date
+    let keys: [Key]
+    let signedPayload: String
+    let rootSignature: String
+  }
+
   struct Manifest: Decodable {
     struct Campaign: Decodable {
       struct Branch: Decodable {
@@ -51,11 +56,13 @@ struct ExperienceBootstrapResponse: Decodable {
     let sourceId: String
     /// Public source/app key bound into the collector's signed payload.
     let sourceKey: String
-    let sourceManifestVersion: Int
+    let manifestVersion: Int
     let environment: String
+    let issuedAt: Date
     let expiresAt: Date
     let campaigns: [Campaign]
   }
+  let onlineKeyset: OnlineKeyset
   /// The unsigned compatibility copy returned by the collector.
   ///
   /// It is decoded only so the response shape remains compatible with the
@@ -182,13 +189,10 @@ struct ExperienceContextWire: Encodable {
 }
 
 struct ExperienceDecisionRequest: Encodable {
-  let schemaVersion = 1
-  let consent: WtsExperienceConsent
-  let profileConsentGranted: Bool
+  let schemaVersion = 2
   let actorId: String
   let sessionId: String
   let metadata: WtsMetadata
-  let settings: ExperienceSettingsWire
   let testDeviceToken: String
   let candidateVersionIds: [String]
   let context: ExperienceContextWire
@@ -212,7 +216,9 @@ struct ExperienceDecisionResponse: Decodable {
     let content: Variant?
     let grant: String
   }
+  let mode: String
   let decisions: [Decision]
+  let serverTime: Date
 }
 
 struct ExperienceInteractionRequest: Codable {
@@ -225,6 +231,7 @@ struct ExperienceInteractionRequest: Codable {
   let exposureId: String?
   let type: String
   let actionId: String?
+  let actionOutcome: String?
   let triggerEventId: String?
   let occurredAt: Date
   let metadata: WtsMetadata
@@ -232,9 +239,7 @@ struct ExperienceInteractionRequest: Codable {
 }
 
 struct ExperienceInteractionBatchRequest: Encodable {
-  let schemaVersion = 1
-  let consent: WtsExperienceConsent
-  let profileConsentGranted: Bool
+  let schemaVersion = 2
   let actorId: String
   let sessionId: String
   let interactions: [ExperienceInteractionRequest]

@@ -9,7 +9,7 @@
     static func present(
       _ experience: WtsExperience,
       onImpression: @escaping @Sendable () -> Void,
-      onAction: @escaping @Sendable (WtsExperienceAction) -> Void,
+      onAction: @escaping @Sendable (WtsExperienceAction) async -> Bool,
       onDismiss: @escaping @Sendable (WtsExperienceDismissReason) -> Void
     ) async -> Bool {
       guard let presenter = topViewController(), presenter.presentedViewController == nil else {
@@ -62,7 +62,7 @@
   private final class ExperienceViewController: UIViewController {
     private let experience: WtsExperience
     private let onImpression: @Sendable () -> Void
-    private let onAction: @Sendable (WtsExperienceAction) -> Void
+    private let onAction: @Sendable (WtsExperienceAction) async -> Bool
     private let onDismiss: @Sendable (WtsExperienceDismissReason) -> Void
     private var impressionTask: Task<Void, Never>?
     private var autoCloseTask: Task<Void, Never>?
@@ -73,7 +73,7 @@
     init(
       experience: WtsExperience,
       onImpression: @escaping @Sendable () -> Void,
-      onAction: @escaping @Sendable (WtsExperienceAction) -> Void,
+      onAction: @escaping @Sendable (WtsExperienceAction) async -> Bool,
       onDismiss: @escaping @Sendable (WtsExperienceDismissReason) -> Void
     ) {
       self.experience = experience
@@ -210,8 +210,10 @@
     }
 
     private func perform(_ action: WtsExperienceAction) {
-      onAction(action)
-      finish(reason: .dismissed)
+      Task { [weak self] in
+        guard await self?.onAction(action) == true else { return }
+        self?.finish(reason: .dismissed)
+      }
     }
 
     private var isAtLeastHalfVisible: Bool {

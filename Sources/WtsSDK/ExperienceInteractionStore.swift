@@ -15,7 +15,7 @@ struct FileExperienceInteractionStore: ExperienceInteractionStoring {
       for: .applicationSupportDirectory,
       in: .userDomainMask
     ).first!.appendingPathComponent("co.wetus.wts-sdk", isDirectory: true)
-    self.fileURL = fileURL ?? directory.appendingPathComponent("experience-interactions-v1.json")
+    self.fileURL = fileURL ?? directory.appendingPathComponent("experience-interactions-v2.json")
     encoder = JSONEncoder.wts
     decoder = JSONDecoder.wts
   }

@@ -1,10 +1,13 @@
 import Foundation
 import Security
 
-protocol InstallIdentityProviding: Sendable { func value() throws -> String }
+protocol InstallIdentityProviding: Sendable {
+  func value() throws -> String
+  func clear() throws
+}
 
 struct KeychainInstallIdentity: InstallIdentityProviding {
-  private let service = "co.wetus.wts-sdk"
+  private let service = "co.wetus.wts-sdk.v0.5"
   private let account = "install-id"
 
   func value() throws -> String {
@@ -36,5 +39,16 @@ struct KeychainInstallIdentity: InstallIdentityProviding {
       ] as CFDictionary
     guard SecItemAdd(attributes, nil) == errSecSuccess else { throw WtsSDKError.storage }
     return value
+  }
+
+  func clear() throws {
+    let status = SecItemDelete([
+      kSecClass: kSecClassGenericPassword,
+      kSecAttrService: service,
+      kSecAttrAccount: account,
+    ] as CFDictionary)
+    guard status == errSecSuccess || status == errSecItemNotFound else {
+      throw WtsSDKError.storage
+    }
   }
 }
