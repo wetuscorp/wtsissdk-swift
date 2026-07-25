@@ -5,6 +5,19 @@ import XCTest
 @testable import WtsSDK
 
 final class WtsSDKTests: XCTestCase {
+  func testEmbeddedProductionRootIsCanonicalAndHasExpectedFingerprint() throws {
+    let encoded = ExperienceTrust.rootPublicKey
+    let der = try XCTUnwrap(Data(base64Encoded: encoded))
+    XCTAssertEqual(der.base64EncodedString(), encoded)
+    XCTAssertEqual(
+      Array(der.prefix(12)),
+      [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00]
+    )
+    XCTAssertEqual(der.count, 44)
+    let digest = Data(SHA256.hash(data: der)).base64URLEncodedString
+    XCTAssertEqual(digest, "c_dZ_7kxZ_zrwwzdif7yziZCREvj6PTilcqkacX-ac4")
+  }
+
   func testPendingUsesOnlyFunctionalResolveAndCreatesNoIdentity() async throws {
     let identity = StaticIdentity()
     let events = MemoryEventStore()

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0-alpha.2
+
+- Fixed SwiftPM and CocoaPods releases to carry the canonical production
+  Experiences root public key instead of a release-time placeholder.
+- Made release validation immutable and reproducible by checking the committed
+  Ed25519 SPKI key and production fingerprint without rewriting source.
+- Public APIs and Experiences Protocol V2 fixtures are unchanged.
+
 ## 0.4.0-alpha.1
 
 - Verify Experience manifests with configured base64 SPKI DER Ed25519 public

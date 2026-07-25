@@ -15,9 +15,8 @@ jobs:
       - name: Verify tag and contracts
         run: |
           test "${GITHUB_REF_NAME}" = "$(ruby -e 'puts File.read("WtsSDK.podspec")[/s.version = '\''([^'\'']+)/, 1]')"
-          chmod +x scripts/verify-contracts.sh scripts/embed-release-root.sh scripts/verify-release-root.sh
+          chmod +x scripts/verify-contracts.sh scripts/verify-release-root.sh
           scripts/verify-contracts.sh
-          scripts/embed-release-root.sh
           scripts/verify-release-root.sh
       - run: swift test --parallel
       - run: pod lib lint WtsSDK.podspec --allow-warnings
