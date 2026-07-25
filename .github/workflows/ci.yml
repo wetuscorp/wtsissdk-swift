@@ -10,7 +10,7 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
-      - run: chmod +x scripts/verify-contracts.sh && scripts/verify-contracts.sh
+      - run: chmod +x scripts/verify-contracts.sh scripts/verify-release-root.sh && scripts/verify-contracts.sh && scripts/verify-release-root.sh
       - run: swift package resolve
       - run: swift test --parallel
       - run: pod lib lint WtsSDK.podspec --allow-warnings

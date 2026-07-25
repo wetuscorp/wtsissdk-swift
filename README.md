@@ -2,9 +2,9 @@
 
 Official iOS SDK for wts.is deep links, analytics, identity, and deployless Experiences.
 
-> `0.5.0-alpha.1` · Mobile Protocol V4 · Experiences Protocol V2 · SDK Test Session V2 · iOS 15+ · Swift 5.9+
+> `0.5.0-alpha.2` · Mobile Protocol V4 · Experiences Protocol V2 · SDK Test Session V2 · iOS 15+ · Swift 5.9+
 
-Pin this alpha exactly. The dashboard, backend, Swift/Android cores, and Flutter/React Native wrappers must use the coordinated `0.5.0-alpha.1` release.
+Pin this alpha exactly. The dashboard, backend, Swift/Android cores, and Flutter/React Native wrappers recommend the coordinated `0.5.0-alpha.2` release.
 
 ## Install
 
@@ -12,13 +12,13 @@ Swift Package Manager:
 
 ```text
 https://github.com/wetuscorp/wtsissdk-swift.git
-Exact Version: 0.5.0-alpha.1
+Exact Version: 0.5.0-alpha.2
 ```
 
 CocoaPods:
 
 ```ruby
-pod 'WtsSDK', '0.5.0-alpha.1'
+pod 'WtsSDK', '0.5.0-alpha.2'
 ```
 
 ## One-time integration
@@ -92,9 +92,8 @@ Test Session V2 is available only after unified consent is granted. A ready test
 
 ## Trust and release
 
-The long-lived root private key must never enter this repository or backend. The
-release environment supplies the ceremony-produced base64 SPKI Ed25519 public
-key as `WTS_EXPERIENCE_ROOT_PUBLIC_KEY`; the release workflow validates and
-embeds it into `Sources/WtsSDK/ExperienceTrust.swift` before compiling. It
-fails closed if the variable is missing, malformed, or not Ed25519. Normal
-online leaf-key rotation then requires no app deployment.
+The long-lived root private key must never enter this repository or backend.
+The ceremony-produced base64 SPKI Ed25519 public key is a versioned source
+constant. Release CI validates its canonical encoding, production fingerprint,
+and—when configured—exact equality with `WTS_EXPERIENCE_ROOT_PUBLIC_KEY`; it
+never rewrites source. Normal online leaf-key rotation requires no app deploy.

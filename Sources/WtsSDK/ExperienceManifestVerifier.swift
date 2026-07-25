@@ -13,7 +13,6 @@ enum ExperienceManifestVerifier {
     decoder: JSONDecoder
   ) -> ExperienceBootstrapResponse.Manifest? {
     guard
-      rootPublicKey != "__WTS_EXPERIENCE_ROOT_PUBLIC_KEY__",
       let rootKeyData = Data(base64Encoded: rootPublicKey),
       let keysetPayload = Data(base64URLEncoded: response.onlineKeyset.signedPayload),
       let rootSignature = Data(base64URLEncoded: response.onlineKeyset.rootSignature),

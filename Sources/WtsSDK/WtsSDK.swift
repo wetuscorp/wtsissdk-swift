@@ -6,7 +6,7 @@ import Foundation
 
 public actor WtsSDK {
   public static let shared = WtsSDK()
-  public static let version = "0.5.0-alpha.1"
+  public static let version = "0.5.0-alpha.2"
 
   private let transport: HTTPTransport
   private let identity: InstallIdentityProviding
