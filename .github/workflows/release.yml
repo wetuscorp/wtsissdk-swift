@@ -11,7 +11,7 @@ jobs:
     env:
       WTS_EXPERIENCE_ROOT_PUBLIC_KEY: ${{ vars.WTS_EXPERIENCE_ROOT_PUBLIC_KEY }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Verify tag and contracts
         run: |
           test "${GITHUB_REF_NAME}" = "$(ruby -e 'puts File.read("WtsSDK.podspec")[/s.version = '\''([^'\'']+)/, 1]')"

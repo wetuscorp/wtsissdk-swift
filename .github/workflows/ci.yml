@@ -9,7 +9,7 @@ jobs:
   test:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: chmod +x scripts/verify-contracts.sh scripts/verify-release-root.sh && scripts/verify-contracts.sh && scripts/verify-release-root.sh
       - run: swift package resolve
       - run: swift test --parallel
